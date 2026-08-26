@@ -35,7 +35,7 @@ Run these in order against the local server.
 | 1 | `cargo run --release -- --mode minimap` | A continuously refreshed top-down slice with `@` at the bot's position; `?` is an unloaded chunk. |
 | 2 | `cargo run --release -- --mode ray` | Prints the first block straight ahead, coordinates, entry face, and distance. Spot-check this in-game. |
 | 3–7 | `cargo run --release -- --mode render --width 40 --height 20 --fps 12` | Low-resolution live first-person view with packet-backed lighting, day/night sky, water/glass transparency, and underwater overlay. |
-| final | `cargo run --release -- --mode render` | `WASD` movement, `Shift+W` sprint, arrow-key look, `Space` jump/swim, `X` stop, `C` crouch, `Q` quit. |
+| final | `cargo run --release -- --mode render` | `WASD` movement, `Shift+W` sprint, arrow-key look, plus a live 15×15 navigation minimap. `Space` jumps/swims, `X` stops, `C` crouches, `Q` quits. |
 
 The renderer requests an 8-chunk view distance by default. Adjust it and the
 ray distance together if terrain appears as the dark unloaded-chunk color:
@@ -62,6 +62,11 @@ cargo run --release -- --mode render --view-distance 12 --distance 80
 - Water, glass, ice, and lava are alpha-composited through a maximum of four
   translucent layers per ray. Leaves remain opaque and green for readability.
   Water and lava also tint the whole image while the camera is inside them.
+- Render mode includes a 15×15 terrain-projection minimap: north is up, the
+  centered `^`/`>`/`v`/`<` marker shows facing, and `?` denotes unloaded data.
+  It reserves 19 terminal columns and automatically shrinks the viewport when
+  necessary; terminals narrower than 39 columns, or render heights below 19,
+  keep the full first-person view without the sidebar.
 - Keyboard movement is latched because most terminal protocols do not expose
   reliable key-release events. Press `X` to stop; terminals that do send
   releases stop movement automatically. Space can be repeated to swim upward.

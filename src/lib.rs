@@ -721,6 +721,64 @@ pub fn minimap(source: &impl BlockSource, center: BlockPos, radius: i32) -> Stri
     output
 }
 
+/// A compact navigation map that projects nearby terrain beneath the camera.
+///
+/// North (-Z) is at the top of the returned map. For each column, the first
+/// solid block at or below `center.y` is shown, which makes the map useful
+/// while standing above terrain instead of displaying an empty eye-level air
+/// slice. `?` still means that no loaded terrain was available in the scan.
+pub fn navigation_minimap(
+    source: &impl BlockSource,
+    center: BlockPos,
+    yaw_degrees: f32,
+    radius: i32,
+) -> String {
+    const SURFACE_SCAN_DEPTH: i32 = 8;
+
+    let radius = radius.max(1);
+    let mut output = String::new();
+    for z in (center.z - radius)..=(center.z + radius) {
+        for x in (center.x - radius)..=(center.x + radius) {
+            if x == center.x && z == center.z {
+                output.push(navigation_heading(yaw_degrees));
+            } else {
+                output.push(navigation_character(
+                    source,
+                    BlockPos::new(x, center.y, z),
+                    SURFACE_SCAN_DEPTH,
+                ));
+            }
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn navigation_heading(yaw_degrees: f32) -> char {
+    // Minecraft yaw 0 faces south (+Z), which is down on the map; -90 faces
+    // east (+X), which is to the right.
+    let yaw = yaw_degrees.rem_euclid(360.0);
+    match yaw {
+        value if !(45.0..315.0).contains(&value) => 'v',
+        value if value < 135.0 => '<',
+        value if value < 225.0 => '^',
+        _ => '>',
+    }
+}
+
+fn navigation_character(source: &impl BlockSource, top: BlockPos, depth: i32) -> char {
+    let mut saw_unloaded = false;
+    for y in ((top.y - depth)..=top.y).rev() {
+        let position = BlockPos::new(top.x, y, top.z);
+        match source.voxel_at(position) {
+            Voxel::Solid(block) => return minimap_character(block.id),
+            Voxel::Unloaded => saw_unloaded = true,
+            Voxel::Air => {}
+        }
+    }
+    if saw_unloaded { '?' } else { ' ' }
+}
+
 fn minimap_character(id: &str) -> char {
     match id {
         "grass_block" => 'g',
@@ -846,6 +904,26 @@ mod tests {
         assert!((forward.z - 1.0).abs() < 1e-10);
         assert!((right.x - 1.0).abs() < 1e-10);
         assert!((up.y - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn navigation_minimap_projects_terrain_and_marks_heading() {
+        let mut world = TestWorld::default();
+        world.0.insert(
+            BlockPos::new(-1, 0, -1),
+            Voxel::Solid(Block { id: "stone" }),
+        );
+        world
+            .0
+            .insert(BlockPos::new(1, 1, 0), Voxel::Solid(Block { id: "water" }));
+
+        let map = navigation_minimap(&world, BlockPos::new(0, 3, 0), 0.0, 1);
+        let rows: Vec<_> = map.lines().collect();
+
+        assert_eq!(rows, ["#  ", " v~", "   "]);
+        assert_eq!(navigation_heading(-90.0), '>');
+        assert_eq!(navigation_heading(90.0), '<');
+        assert_eq!(navigation_heading(180.0), '^');
     }
 
     #[test]

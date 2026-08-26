@@ -19,16 +19,24 @@ use crossterm::{
 };
 use eyre::Result;
 
-use mctui::{Camera, Frame, RenderConfig, Rgb, lighting::LightStore};
+use mctui::{Camera, Frame, RenderConfig, Rgb, lighting::LightStore, navigation_minimap};
+
+const MINIMAP_RADIUS: i32 = 7;
+const MINIMAP_WIDTH: usize = (MINIMAP_RADIUS as usize * 2) + 1;
+const MINIMAP_SIDEBAR_COLUMNS: usize = MINIMAP_WIDTH + 4; // gap, borders, and map cells
+const MINIMAP_ROWS: usize = MINIMAP_WIDTH + 4; // title, borders, cells, legend
+const MIN_RENDER_COLUMNS: usize = 20;
 
 /// Run the interactive renderer until the user presses `q` or Escape.
 pub fn run(
     bot: Client,
-    config: RenderConfig,
+    mut config: RenderConfig,
     target_fps: u16,
     lighting: Arc<RwLock<LightStore>>,
 ) -> Result<()> {
     let mut session = TerminalSession::enter()?;
+    let layout = session.layout_for(config);
+    config.width = layout.frame_width;
     let frame_period = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
     let mut last_frame_at = Instant::now();
     let mut frames = 0_u32;
@@ -57,12 +65,21 @@ pub fn run(
 
         // Keep one read lock for the entire frame so every ray samples a
         // coherent snapshot of chunks that Azalea has already received.
-        let frame = {
+        let (frame, minimap) = {
             let world = bot.world()?;
             let world = world.read();
             let lighting = lighting.read().expect("lighting cache lock poisoned");
             let live_world = crate::live::AzaleaWorld::new(&world, &lighting);
-            Frame::render(&live_world, camera, config)
+            let frame = Frame::render(&live_world, camera, config);
+            let minimap = layout.show_minimap.then(|| {
+                navigation_minimap(
+                    &live_world,
+                    camera.origin.floor_to_block(),
+                    camera.yaw_degrees,
+                    MINIMAP_RADIUS,
+                )
+            });
+            (frame, minimap)
         };
 
         frames += 1;
@@ -83,6 +100,7 @@ pub fn run(
                 direction.y_rot(),
                 direction.x_rot(),
             ),
+            minimap.as_deref(),
         )?;
 
         let remaining = frame_period.saturating_sub(last_frame_at.elapsed());
@@ -172,6 +190,12 @@ struct TerminalSession {
     reports_key_releases: bool,
 }
 
+#[derive(Clone, Copy)]
+struct RenderLayout {
+    frame_width: usize,
+    show_minimap: bool,
+}
+
 impl TerminalSession {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
@@ -205,7 +229,27 @@ impl TerminalSession {
         Ok(session)
     }
 
-    fn draw(&mut self, frame: &Frame, status: &str) -> Result<()> {
+    fn layout_for(&self, config: RenderConfig) -> RenderLayout {
+        let columns = terminal::size()
+            .map(|(columns, _)| columns as usize)
+            .unwrap_or(config.width + MINIMAP_SIDEBAR_COLUMNS);
+        let show_minimap = config.height >= MINIMAP_ROWS
+            && columns >= MIN_RENDER_COLUMNS + MINIMAP_SIDEBAR_COLUMNS;
+        let frame_width = if show_minimap {
+            config
+                .width
+                .min(columns.saturating_sub(MINIMAP_SIDEBAR_COLUMNS))
+        } else {
+            config.width.min(columns.max(1))
+        };
+        RenderLayout {
+            frame_width,
+            show_minimap,
+        }
+    }
+
+    fn draw(&mut self, frame: &Frame, status: &str, minimap: Option<&str>) -> Result<()> {
+        let minimap_rows: Vec<_> = minimap.map_or_else(Vec::new, |map| map.lines().collect());
         let mut bytes = String::with_capacity(frame.width * frame.sample_height * 22);
         bytes.push_str("\x1b[H\x1b[0m\x1b[2K");
         bytes.push_str(status);
@@ -225,11 +269,32 @@ impl TerminalSession {
                     frame.pixel(column, row * 2 + 1),
                 );
             }
-            bytes.push_str("\x1b[0m\r\n");
+            append_minimap_sidebar(&mut bytes, row, &minimap_rows);
+            bytes.push_str("\x1b[0m\x1b[K\r\n");
         }
         self.output.write_all(bytes.as_bytes())?;
         self.output.flush()?;
         Ok(())
+    }
+}
+
+fn append_minimap_sidebar(output: &mut String, row: usize, minimap_rows: &[&str]) {
+    if minimap_rows.is_empty() {
+        return;
+    }
+
+    output.push_str("\x1b[0m  ");
+    match row {
+        0 => output.push_str("minimap (N up)"),
+        1 => output.push_str("+---------------+"),
+        map_row @ 2..=16 => {
+            output.push('|');
+            output.push_str(minimap_rows[map_row - 2]);
+            output.push('|');
+        }
+        17 => output.push_str("+---------------+"),
+        18 => output.push_str("? = unloaded"),
+        _ => {}
     }
 }
 
