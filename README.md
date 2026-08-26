@@ -1,6 +1,9 @@
+
 # mctui
 
 **A live first-person Minecraft Java renderer for the terminal.**
+
+<img width="800" height="519" alt="2026-08-2602-01-08-ezgif com-speed" src="https://github.com/user-attachments/assets/330568b6-eb5b-4371-8db9-a626832f2755" />
 
 `mctui` connects to a local Minecraft server as a client, consumes the chunks
 and lighting data it receives, and renders the world as a 24-bit ANSI view in
