@@ -10,7 +10,10 @@ use std::{
 use azalea::{Client, SprintDirection, WalkDirection};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -163,14 +166,40 @@ fn apply_key(bot: &Client, key: KeyEvent) -> Result<bool> {
 
 struct TerminalSession {
     output: io::Stdout,
+    reports_key_releases: bool,
 }
 
 impl TerminalSession {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
-        let mut output = io::stdout();
-        execute!(output, EnterAlternateScreen, Hide, Clear(ClearType::All))?;
-        Ok(Self { output })
+        let supports_key_releases = matches!(terminal::supports_keyboard_enhancement(), Ok(true));
+        let mut session = Self {
+            output: io::stdout(),
+            reports_key_releases: false,
+        };
+        execute!(
+            session.output,
+            EnterAlternateScreen,
+            Hide,
+            Clear(ClearType::All)
+        )?;
+
+        if supports_key_releases {
+            // Kitty's legacy mode only sends presses. The all-keys flag is
+            // required for printable movement keys such as WASD, while the
+            // event-type flag adds the release events read_input already uses.
+            execute!(
+                session.output,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )?;
+            session.reports_key_releases = true;
+        }
+
+        Ok(session)
     }
 
     fn draw(&mut self, frame: &Frame, status: &str) -> Result<()> {
@@ -178,9 +207,11 @@ impl TerminalSession {
         bytes.push_str("\x1b[H\x1b[0m\x1b[2K");
         bytes.push_str(status);
         bytes.push_str("\r\n\x1b[2K");
-        bytes.push_str(
-            "WASD move · Shift+W sprint · arrows look · Space jump/swim · X stop · C crouch · Q quit",
-        );
+        bytes.push_str(if self.reports_key_releases {
+            "WASD move/release stop · Shift+W sprint · arrows look · Space jump/swim · X stop · C crouch · Q quit"
+        } else {
+            "WASD move · Shift+W sprint · arrows look · Space jump/swim · X stop · C crouch · Q quit"
+        });
         bytes.push_str("\x1b[0m\r\n");
 
         for row in 0..(frame.sample_height / 2) {
@@ -201,6 +232,9 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        if self.reports_key_releases {
+            let _ = execute!(self.output, PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(self.output, Show, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
