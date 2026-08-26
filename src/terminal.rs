@@ -122,8 +122,11 @@ fn apply_key(bot: &Client, key: KeyEvent) -> Result<bool> {
     let movement = match key.code {
         KeyCode::Char('w') => Some(WalkDirection::Forward),
         KeyCode::Char('s') => Some(WalkDirection::Backward),
-        KeyCode::Char('a') => Some(WalkDirection::Left),
-        KeyCode::Char('d') => Some(WalkDirection::Right),
+        // Azalea's lateral walk directions are inverted relative to the
+        // rendered camera's handedness, so map the familiar WASD bindings
+        // accordingly.
+        KeyCode::Char('a') => Some(WalkDirection::Right),
+        KeyCode::Char('d') => Some(WalkDirection::Left),
         KeyCode::Char(' ') => {
             bot.jump();
             return Ok(true);
