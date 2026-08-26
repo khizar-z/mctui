@@ -1,102 +1,164 @@
 # mctui
 
-`mctui` is a Rust client that connects to a live Minecraft Java Edition server
-and renders the chunks streamed to its bot as a first-person 24-bit ANSI view.
-It uses Azalea for protocol/world state and a custom Amanatides & Woo voxel
-raycaster for every terminal sample.
+**A live first-person Minecraft Java renderer for the terminal.**
 
-This is intended for an offline-mode local vanilla/Paper server during
-development. The program refuses non-loopback server addresses unless
-`--allow-public-server` is supplied explicitly.
+`mctui` connects to a local Minecraft server as a client, consumes the chunks
+and lighting data it receives, and renders the world as a 24-bit ANSI view in
+real time. It is written in Rust and uses a custom voxel raycaster rather than
+capturing or proxying the official game client.
 
-## Prerequisites
+The project is a systems-focused exploration of real-time rendering on a text
+terminal: networking state arrives asynchronously, blocks are raycast through
+a streamed voxel world, and each terminal cell represents two independently
+coloured pixels.
 
-- Rust nightly (pinned in [rust-toolchain.toml](rust-toolchain.toml)); Azalea
-  0.16 currently requires nightly because of its `simdnbt` dependency.
-- A local Minecraft Java server compatible with Azalea 0.16 (`mc26.2`).
-- A terminal with ANSI true-color support. macOS Terminal, iTerm2, WezTerm,
-  Ghostty, and most modern Linux terminals work.
+## Highlights
 
-Start the offline-mode local server yourself, then use a distinct bot name:
-
-```sh
-cargo run --release -- --server 127.0.0.1:25565 --username terminal_view --mode monitor
-```
-
-The default server is `127.0.0.1:25565`, so it can be omitted.
-
-## Phase validation commands
-
-Run these in order against the local server.
-
-| Phase | Command | Expected result |
-| --- | --- | --- |
-| 0–2 | `cargo run --release -- --mode monitor` | Logs connection, spawn, position/yaw, packet-backed `block`/`sky` light, and the current day factor. |
-| 1 | `cargo run --release -- --mode minimap` | A continuously refreshed top-down slice with `@` at the bot's position; `?` is an unloaded chunk. |
-| 2 | `cargo run --release -- --mode ray` | Prints the first block straight ahead, coordinates, entry face, and distance. Spot-check this in-game. |
-| 3–7 | `cargo run --release -- --mode render --width 40 --height 20 --fps 12` | Low-resolution live first-person view with packet-backed lighting, day/night sky, water/glass transparency, and underwater overlay. |
-| final | `cargo run --release -- --mode render` | `WASD` movement, `Shift+W` sprint, arrow-key look, plus a live 15×15 navigation minimap. `Space` jumps/swims, `X` stops, `C` crouches, `Q` quits. |
-
-The renderer requests an 8-chunk view distance by default. Adjust it and the
-ray distance together if terrain appears as the dark unloaded-chunk color:
-
-```sh
-cargo run --release -- --mode render --view-distance 12 --distance 80
-```
-
-## Design notes
-
-- One `▀` uses independent 24-bit foreground (top) and background (bottom)
-  colors, producing two vertical ray samples per terminal character row.
-- Each frame holds Azalea's world read lock while it raycasts, so all rays see
-  a coherent received-chunk snapshot. Missing chunks are deliberately not
-  treated as empty sky.
-- Azalea intentionally does not retain light or clock state in its world
-  object. mctui captures `Level Chunk with Light`, `Update Light`, and `Set
-  Time` packets into a compact 2,048-byte-per-section sidecar cache. Its
-  monitor output says `packet clock` once a real server clock update arrives.
-- Block shading uses `max(block_light, sky_light × day_factor)` with a
-  non-linear brightness curve; light fog and entry-face shading remain only
-  as depth cues. The compact palette covers common terrain and falls back to
-  neutral stone gray for unknown blocks.
-- Water, glass, ice, and lava are alpha-composited through a maximum of four
-  translucent layers per ray. Leaves remain opaque and green for readability.
-  Water and lava also tint the whole image while the camera is inside them.
-- Render mode includes a 15×15 terrain-projection minimap: north is up, the
-  centered `^`/`>`/`v`/`<` marker shows facing, and `?` denotes unloaded data.
-  It reserves 19 terminal columns and automatically shrinks the viewport when
-  necessary; terminals narrower than 39 columns, or render heights below 19,
-  keep the full first-person view without the sidebar.
-- `--entities` enables experimental nearby-entity silhouettes: yellow for
-  other players, green for passive entities, and red for hostile mobs. These
-  visual-only snapshots never send interaction packets. They are opt-in while
-  their Azalea ECS lock behavior is being validated.
-- Keyboard movement is latched because most terminal protocols do not expose
-  reliable key-release events. Press `X` to stop; terminals that do send
-  releases stop movement automatically. Space can be repeated to swim upward.
-
-## Lighting validation on the local server
-
-Run monitor mode while manually placing or moving the bot with the existing
-controls. In open daylight it should report `block=0 sky=15`; beside a torch,
-`block` should rise, while a dark interior should show both values low or zero.
-
-If you have operator access on the local Paper server, use its console or an
-ordinary player to run these manual checks, then watch the monitor line update:
+- Live Minecraft Java world data via [Azalea](https://github.com/azalea-rs/azalea)
+- Custom Amanatides & Woo DDA voxel raycaster
+- 24-bit ANSI rendering using foreground/background half-block characters
+- Packet-backed block light, sky light, and server time-of-day
+- Water, glass, ice, and lava transparency with camera-underwater overlays
+- Interactive movement, sprinting, jumping, crouching, and look controls
+- 15×15 navigation minimap that projects nearby terrain below the player
+- Conservative unloaded-chunk handling: unknown terrain is never rendered as sky
 
 ```text
-/time set 6000     # day factor near 1.00
-/time set 18000    # day factor near 0.00
+Minecraft packets → streamed chunk state + light cache → DDA raycaster → ANSI terminal frame
 ```
 
-Finally, use render mode to look through a glass block or water at terrain
-behind it, and enter/leave water to verify the full-frame blue overlay. These
-checks do not add any gameplay automation to mctui.
+## Quick start
 
-## Safety
+### Prerequisites
 
-The client only renders, changes view direction, and sends ordinary movement
-inputs. It has no mining, inventory, combat, or interaction automation.
-For an authenticated connection, pass `--online` with a Microsoft account
-cache key, and explicitly pass `--allow-public-server` only after confirming
-that server's bot rules.
+- Rust nightly, selected automatically by the included
+  [`rust-toolchain.toml`](rust-toolchain.toml)
+- A local Minecraft Java server compatible with Minecraft `26.2`
+- A true-colour ANSI terminal (Kitty, iTerm2, WezTerm, Ghostty, macOS Terminal,
+  and most modern Linux terminals work)
+
+Start the server separately, then run mctui from this repository. The default
+connection is an offline-mode local server at `127.0.0.1:25565`.
+
+```sh
+cargo run --release -- --mode render
+```
+
+Use a distinct username when another local player is already connected:
+
+```sh
+cargo run --release -- --username terminal_view --mode render
+```
+
+The client rejects non-loopback server addresses unless
+`--allow-public-server` is supplied explicitly.
+
+## Controls
+
+| Input | Action |
+| --- | --- |
+| `W` / `A` / `S` / `D` | Move forward / left / backward / right |
+| `Shift` + `W` | Sprint forward |
+| Arrow keys | Look in 6° increments |
+| `Space` | Jump or swim upward |
+| `C` | Toggle crouch |
+| `X` | Stop moving |
+| `Q` or `Esc` | Quit |
+
+In terminals that support Kitty keyboard enhancement, releasing a movement key
+also stops movement. `X` is always available as a terminal-independent stop.
+
+## Recommended command
+
+This setting combines a larger viewport with terrain streamed and raycast
+farther from the player:
+
+```sh
+cargo run --release -- --mode render \
+  --width 120 --height 36 --fps 10 \
+  --view-distance 12 --distance 80
+```
+
+Increase `--width` and `--height` for more detail; lower `--fps` or
+`--distance` if rendering becomes too expensive. The navigation minimap uses
+19 additional terminal columns, so a 120-column viewport needs a terminal
+roughly 140 columns wide.
+
+## CLI reference
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--server <HOST:PORT>` | `127.0.0.1:25565` | Minecraft server address |
+| `--username <NAME>` | `mctui` | In-game username |
+| `--mode <MODE>` | `render` | `monitor`, `minimap`, `ray`, or interactive `render` |
+| `--width <COLS>` | `80` | Rendered viewport width in terminal columns |
+| `--height <ROWS>` | `24` | Rendered viewport height in terminal rows |
+| `--fps <FPS>` | `12` | Target interactive frame rate |
+| `--distance <BLOCKS>` | `48` | Maximum DDA ray distance |
+| `--fov <DEGREES>` | `75` | Horizontal field of view |
+| `--view-distance <CHUNKS>` | `8` | Requested server view distance |
+| `--entities` | off | Enable experimental nearby-entity markers |
+| `--online` | off | Use online authentication instead of offline mode |
+| `--allow-public-server` | off | Permit a non-loopback server address |
+
+Run `cargo run --release -- --help` for the authoritative list of options.
+
+### Render modes
+
+| Mode | Purpose |
+| --- | --- |
+| `monitor` | Connection and player-position diagnostics |
+| `minimap` | Top-down view of the loaded terrain around the player |
+| `ray` | Inspect the first block encountered by a camera ray |
+| `render` | Interactive first-person terminal renderer |
+
+## How it works
+
+### World and lighting
+
+Azalea provides the streamed world state used to query block data. mctui also
+maintains a packet-backed sidecar cache for chunk lighting and server time.
+Packed block-light and sky-light arrays are combined with a time-of-day sky
+curve to shade surfaces using the same information the server sends to clients.
+
+### Raycasting and colour
+
+Each frame casts camera rays through blocks using the Amanatides & Woo DDA
+algorithm. Rays distinguish among a solid hit, confirmed open sky, and an
+unloaded or unknown region. The last case renders dark rather than pretending
+the missing data is empty space. A compact material palette, directional
+shading, fog, and light values produce the final colours.
+
+### Terminal output
+
+Terminal rows are rendered with the Unicode upper-half-block character: its
+foreground colour is the upper pixel and its background colour is the lower
+pixel. That gives a 2× vertical effective pixel density while preserving full
+24-bit ANSI colour.
+
+## Development
+
+```sh
+cargo fmt
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+```
+
+`monitor`, `minimap`, and `ray` are deliberately small diagnostic modes that
+make it easier to validate networking, streamed-world data, and raycasting
+without running the full renderer.
+
+## Scope and safety
+
+mctui is a local-world visualiser and renderer. It can render, move, and look;
+it does not mine, craft, manage inventory, fight, or automate gameplay. The
+default local-only connection policy is intentional. If you use
+`--allow-public-server`, follow that server's rules and obtain permission.
+
+## Current limitations
+
+- The material palette is intentionally compact, so some blocks share colours.
+- The renderer can only display chunks the server has sent to the client.
+- Nearby-entity markers are experimental and disabled by default while their
+  world-state integration is being reworked.
