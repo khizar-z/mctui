@@ -430,6 +430,27 @@ pub struct Camera {
     pub pitch_degrees: f32,
 }
 
+/// A read-only entity snapshot used by the terminal renderer.
+///
+/// Entity collection is deliberately kept outside the raycaster so this crate
+/// remains independent of Minecraft networking and ECS implementation details.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntityMarker {
+    /// The entity's feet position in world coordinates.
+    pub position: Vec3,
+    pub width: f64,
+    pub height: f64,
+    pub category: EntityCategory,
+}
+
+/// Visual group used for a compact entity marker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntityCategory {
+    Player,
+    Passive,
+    Hostile,
+}
+
 impl Camera {
     pub fn basis(self) -> (Vec3, Vec3, Vec3) {
         let yaw = self.yaw_degrees.to_radians() as f64;
@@ -488,6 +509,16 @@ impl Frame {
 
     /// Render a frame from the supplied loaded-world view.
     pub fn render(source: &impl BlockSource, camera: Camera, config: RenderConfig) -> Self {
+        Self::render_with_entities(source, camera, config, &[])
+    }
+
+    /// Render a frame and overlay depth-tested snapshots of nearby entities.
+    pub fn render_with_entities(
+        source: &impl BlockSource,
+        camera: Camera,
+        config: RenderConfig,
+        entities: &[EntityMarker],
+    ) -> Self {
         let width = config.width.max(1);
         let sample_height = config.height.max(1).saturating_mul(2);
         let mut pixels = Vec::with_capacity(width * sample_height);
@@ -511,6 +542,15 @@ impl Frame {
                 ));
             }
         }
+        draw_entities(
+            source,
+            camera,
+            config,
+            width,
+            sample_height,
+            &mut pixels,
+            entities,
+        );
         if let Voxel::Solid(block) = source.voxel_at(camera.origin.floor_to_block())
             && let Some((tint, opacity)) = block_appearance(block.id).camera_overlay
         {
@@ -522,6 +562,90 @@ impl Frame {
             width,
             sample_height,
             pixels,
+        }
+    }
+}
+
+fn draw_entities(
+    source: &impl BlockSource,
+    camera: Camera,
+    config: RenderConfig,
+    width: usize,
+    sample_height: usize,
+    pixels: &mut [Rgb],
+    entities: &[EntityMarker],
+) {
+    let (forward, right, up) = camera.basis();
+    let aspect = width as f64 / sample_height as f64;
+    let half_fov = (config.horizontal_fov_degrees.to_radians() as f64 / 2.0).tan();
+    if half_fov <= f64::EPSILON {
+        return;
+    }
+
+    // Draw far-to-near so an unoccluded closer entity naturally wins when
+    // markers overlap on the small terminal raster.
+    let mut entities = entities.to_vec();
+    entities.sort_by(|left, right_marker| {
+        let left_distance = (left.position - camera.origin).length();
+        let right_distance = (right_marker.position - camera.origin).length();
+        right_distance.total_cmp(&left_distance)
+    });
+
+    for entity in entities {
+        if entity.width <= 0.0 || entity.height <= 0.0 {
+            continue;
+        }
+        let center = entity.position + Vec3::new(0.0, entity.height * 0.5, 0.0);
+        let offset = center - camera.origin;
+        let distance = offset.length();
+        let forward_distance = offset.dot(forward);
+        if !distance.is_finite()
+            || distance > config.max_distance
+            || forward_distance <= f64::EPSILON
+        {
+            continue;
+        }
+
+        // Trace with the same opaque/translucent semantics as the terrain
+        // renderer. Unloaded space is intentionally conservative: a marker
+        // must not leak through an unknown chunk.
+        match trace_scene(source, camera.origin, offset, distance).terminal {
+            RayTerminal::Opaque(hit) if hit.distance < distance - entity.width.max(0.5) * 0.5 => {
+                continue;
+            }
+            RayTerminal::Unloaded { .. } => continue,
+            RayTerminal::Opaque(_) | RayTerminal::Miss | RayTerminal::LayerLimit => {}
+        }
+
+        let screen_x = offset.dot(right) / (forward_distance * aspect * half_fov);
+        let screen_y = offset.dot(up) / (forward_distance * half_fov);
+        if !(-1.2..=1.2).contains(&screen_x) || !(-1.2..=1.2).contains(&screen_y) {
+            continue;
+        }
+        let center_x = ((screen_x + 1.0) * 0.5 * width as f64).floor() as isize;
+        let center_y = ((1.0 - screen_y) * 0.5 * sample_height as f64).floor() as isize;
+        let marker_height =
+            ((entity.height / forward_distance / half_fov * sample_height as f64 * 0.5).round()
+                as isize)
+                .clamp(2, 12);
+        let marker_width =
+            ((marker_height as f64 * entity.width / entity.height).round() as isize).clamp(1, 6);
+        let color = match entity.category {
+            EntityCategory::Player => Rgb::new(255, 224, 92),
+            EntityCategory::Passive => Rgb::new(104, 226, 167),
+            EntityCategory::Hostile => Rgb::new(244, 91, 91),
+        };
+
+        let top = center_y - marker_height / 2;
+        for y in top..(top + marker_height) {
+            let head = y == top;
+            let half_width = if head { 0 } else { marker_width / 2 };
+            for x in (center_x - half_width)..=(center_x + half_width) {
+                if x >= 0 && x < width as isize && y >= 0 && y < sample_height as isize {
+                    let pixel = &mut pixels[y as usize * width + x as usize];
+                    *pixel = pixel.mix(color, 0.9);
+                }
+            }
         }
     }
 }
@@ -924,6 +1048,37 @@ mod tests {
         assert_eq!(navigation_heading(-90.0), '>');
         assert_eq!(navigation_heading(90.0), '<');
         assert_eq!(navigation_heading(180.0), '^');
+    }
+
+    #[test]
+    fn entity_markers_are_hidden_by_terrain() {
+        let camera = Camera {
+            origin: Vec3::new(0.5, 0.5, 0.5),
+            yaw_degrees: 0.0,
+            pitch_degrees: 0.0,
+        };
+        let config = RenderConfig {
+            width: 9,
+            height: 6,
+            horizontal_fov_degrees: 75.0,
+            max_distance: 12.0,
+        };
+        let marker = EntityMarker {
+            position: Vec3::new(0.5, 0.0, 5.5),
+            width: 0.6,
+            height: 1.8,
+            category: EntityCategory::Player,
+        };
+        let open_world = TestWorld::default();
+        let empty = Frame::render(&open_world, camera, config);
+        let visible = Frame::render_with_entities(&open_world, camera, config, &[marker]);
+        assert_ne!(visible.pixels, empty.pixels);
+
+        let mut walled_world = TestWorld::default();
+        walled_world.0.insert(BlockPos::new(0, 0, 2), stone());
+        let walled = Frame::render(&walled_world, camera, config);
+        let hidden = Frame::render_with_entities(&walled_world, camera, config, &[marker]);
+        assert_eq!(hidden.pixels, walled.pixels);
     }
 
     #[test]

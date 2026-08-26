@@ -67,6 +67,10 @@ cargo run --release -- --mode render --view-distance 12 --distance 80
   It reserves 19 terminal columns and automatically shrinks the viewport when
   necessary; terminals narrower than 39 columns, or render heights below 19,
   keep the full first-person view without the sidebar.
+- `--entities` enables experimental nearby-entity silhouettes: yellow for
+  other players, green for passive entities, and red for hostile mobs. These
+  visual-only snapshots never send interaction packets. They are opt-in while
+  their Azalea ECS lock behavior is being validated.
 - Keyboard movement is latched because most terminal protocols do not expose
   reliable key-release events. Press `X` to stop; terminals that do send
   releases stop movement automatically. Space can be repeated to swim upward.

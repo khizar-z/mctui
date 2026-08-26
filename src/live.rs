@@ -19,7 +19,8 @@ use azalea::{
 use eyre::{Result, bail};
 
 use mctui::{
-    Block, BlockPos, BlockSource, Camera, LightLevels, RayResult, RenderConfig, Vec3, Voxel,
+    Block, BlockPos, BlockSource, Camera, EntityCategory, EntityMarker, LightLevels, RayResult,
+    RenderConfig, Vec3, Voxel,
     lighting::{LightStore, PacketLightData, WorldTime},
     minimap, raycast,
 };
@@ -72,6 +73,7 @@ pub struct LiveConfig {
     pub render: RenderConfig,
     pub target_fps: u16,
     pub view_distance: u8,
+    pub render_entities: bool,
 }
 
 impl Default for LiveConfig {
@@ -85,6 +87,7 @@ impl Default for LiveConfig {
             render: RenderConfig::default(),
             target_fps: 12,
             view_distance: 8,
+            render_entities: false,
         }
     }
 }
@@ -127,6 +130,7 @@ impl LiveConfig {
                         next_argument("--view-distance", &mut args)?,
                     )?
                 }
+                "--entities" => config.render_entities = true,
                 "--online" => config.online_account = true,
                 "--allow-public-server" => config.allow_public_server = true,
                 "--help" | "-h" => {
@@ -202,6 +206,7 @@ Usage: mctui [options]\n\n\
   --distance BLOCKS       DDA render distance (default: 48)\n\
   --fov DEGREES           Horizontal FOV (default: 75)\n\
   --view-distance CHUNKS  Server chunk request distance (default: 8)\n\
+  --entities              Enable experimental nearby-entity markers\n\
   --online                Use Microsoft authentication instead of offline mode\n\
   --allow-public-server   Required before any non-local connection\n\n\
 Modes: monitor proves bot/position events; minimap proves block access; ray\n\
@@ -246,6 +251,84 @@ impl BlockSource for AzaleaWorld<'_> {
 
     fn day_factor(&self) -> f32 {
         self.lighting.day_factor()
+    }
+}
+
+/// Snapshot the nearest streamed entities for the renderer.
+///
+/// This is intentionally observational: it only reads Azalea's local ECS
+/// state, excludes the controlled bot, and never sends interaction packets.
+pub fn nearby_entity_markers(bot: &Client) -> Vec<EntityMarker> {
+    const MAX_MARKERS: usize = 24;
+
+    let Ok(entities) =
+        bot.nearest_entities::<azalea::ecs::query::Without<azalea::entity::LocalEntity>>()
+    else {
+        return Vec::new();
+    };
+
+    entities
+        .into_iter()
+        .filter_map(|entity| {
+            let category = entity_category(entity.kind().ok()?);
+            let position = entity.position().ok()?;
+            let dimensions = entity.dimensions().ok()?;
+            (dimensions.width > 0.0 && dimensions.height > 0.0).then_some(EntityMarker {
+                position: Vec3::new(position.x, position.y, position.z),
+                width: f64::from(dimensions.width),
+                height: f64::from(dimensions.height),
+                category,
+            })
+        })
+        .take(MAX_MARKERS)
+        .collect()
+}
+
+fn entity_category(kind: azalea::registry::builtin::EntityKind) -> EntityCategory {
+    use azalea::registry::builtin::EntityKind;
+
+    match kind {
+        EntityKind::Player => EntityCategory::Player,
+        EntityKind::Blaze
+        | EntityKind::Bogged
+        | EntityKind::Breeze
+        | EntityKind::CaveSpider
+        | EntityKind::Creeper
+        | EntityKind::Creaking
+        | EntityKind::Drowned
+        | EntityKind::ElderGuardian
+        | EntityKind::Enderman
+        | EntityKind::Endermite
+        | EntityKind::Evoker
+        | EntityKind::Ghast
+        | EntityKind::Guardian
+        | EntityKind::Hoglin
+        | EntityKind::Husk
+        | EntityKind::Illusioner
+        | EntityKind::MagmaCube
+        | EntityKind::Parched
+        | EntityKind::Phantom
+        | EntityKind::Piglin
+        | EntityKind::PiglinBrute
+        | EntityKind::Pillager
+        | EntityKind::Ravager
+        | EntityKind::Shulker
+        | EntityKind::Silverfish
+        | EntityKind::Skeleton
+        | EntityKind::Slime
+        | EntityKind::Spider
+        | EntityKind::Stray
+        | EntityKind::Vex
+        | EntityKind::Vindicator
+        | EntityKind::Warden
+        | EntityKind::Witch
+        | EntityKind::Wither
+        | EntityKind::WitherSkeleton
+        | EntityKind::Zoglin
+        | EntityKind::Zombie
+        | EntityKind::ZombieVillager
+        | EntityKind::ZombifiedPiglin => EntityCategory::Hostile,
+        _ => EntityCategory::Passive,
     }
 }
 
@@ -326,6 +409,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                         config.render,
                         config.target_fps,
                         lighting,
+                        config.render_entities,
                     ) {
                         eprintln!("terminal renderer stopped: {error:?}");
                         render_bot.exit();
