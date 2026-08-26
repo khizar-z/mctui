@@ -1,0 +1,229 @@
+//! ANSI terminal presentation and input handling.
+
+use std::{
+    io::{self, Write},
+    sync::{Arc, RwLock},
+    thread,
+    time::{Duration, Instant},
+};
+
+use azalea::{Client, SprintDirection, WalkDirection};
+use crossterm::{
+    cursor::{Hide, Show},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use eyre::Result;
+
+use mctui::{Camera, Frame, RenderConfig, Rgb, lighting::LightStore};
+
+/// Run the interactive renderer until the user presses `q` or Escape.
+pub fn run(
+    bot: Client,
+    config: RenderConfig,
+    target_fps: u16,
+    lighting: Arc<RwLock<LightStore>>,
+) -> Result<()> {
+    let mut session = TerminalSession::enter()?;
+    let frame_period = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
+    let mut last_frame_at = Instant::now();
+    let mut frames = 0_u32;
+    let mut fps = 0.0_f32;
+    let mut fps_window = Instant::now();
+
+    loop {
+        let frame_started = Instant::now();
+        if !read_input(&bot)? {
+            bot.exit();
+            break;
+        }
+
+        let (position, direction) = match (bot.eye_position(), bot.direction()) {
+            (Ok(position), Ok(direction)) => (position, direction),
+            _ => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
+        let camera = Camera {
+            origin: mctui::Vec3::new(position.x, position.y, position.z),
+            yaw_degrees: direction.y_rot(),
+            pitch_degrees: direction.x_rot(),
+        };
+
+        // Keep one read lock for the entire frame so every ray samples a
+        // coherent snapshot of chunks that Azalea has already received.
+        let frame = {
+            let world = bot.world()?;
+            let world = world.read();
+            let lighting = lighting.read().expect("lighting cache lock poisoned");
+            let live_world = crate::live::AzaleaWorld::new(&world, &lighting);
+            Frame::render(&live_world, camera, config)
+        };
+
+        frames += 1;
+        let elapsed = fps_window.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            fps = frames as f32 / elapsed.as_secs_f32();
+            frames = 0;
+            fps_window = Instant::now();
+        }
+        let render_ms = frame_started.elapsed().as_secs_f32() * 1_000.0;
+        session.draw(
+            &frame,
+            &format!(
+                "mctui  {fps:>4.1} fps  {render_ms:>5.1} ms  pos {:.1} {:.1} {:.1}  yaw {:.1} pitch {:.1}",
+                position.x,
+                position.y,
+                position.z,
+                direction.y_rot(),
+                direction.x_rot(),
+            ),
+        )?;
+
+        let remaining = frame_period.saturating_sub(last_frame_at.elapsed());
+        if !remaining.is_zero() {
+            thread::sleep(remaining);
+        }
+        last_frame_at = Instant::now();
+    }
+
+    Ok(())
+}
+
+fn read_input(bot: &Client) -> Result<bool> {
+    while event::poll(Duration::ZERO)? {
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            // Most terminal emulators do not report key releases. If one does,
+            // honour it by stopping the ongoing walk command.
+            if matches!(key.code, KeyCode::Char('w' | 'a' | 's' | 'd')) {
+                bot.walk(WalkDirection::None);
+            }
+            continue;
+        }
+        if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+            continue;
+        }
+        if !apply_key(bot, key)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn apply_key(bot: &Client, key: KeyEvent) -> Result<bool> {
+    let movement = match key.code {
+        KeyCode::Char('w') => Some(WalkDirection::Forward),
+        KeyCode::Char('s') => Some(WalkDirection::Backward),
+        KeyCode::Char('a') => Some(WalkDirection::Left),
+        KeyCode::Char('d') => Some(WalkDirection::Right),
+        KeyCode::Char(' ') => {
+            bot.jump();
+            return Ok(true);
+        }
+        KeyCode::Char('x') => {
+            bot.walk(WalkDirection::None);
+            return Ok(true);
+        }
+        KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
+        _ => None,
+    };
+
+    if let Some(movement) = movement {
+        if key.modifiers.contains(KeyModifiers::SHIFT) && movement == WalkDirection::Forward {
+            bot.sprint(SprintDirection::Forward);
+        } else {
+            bot.walk(movement);
+        }
+        return Ok(true);
+    }
+
+    let look_step = 4.0;
+    let current = bot.direction()?;
+    let (yaw, pitch) = match key.code {
+        // Azalea's yaw sign is the opposite of the intuitive terminal
+        // left/right direction in this camera projection.
+        KeyCode::Left => (current.y_rot() + look_step, current.x_rot()),
+        KeyCode::Right => (current.y_rot() - look_step, current.x_rot()),
+        KeyCode::Up => (current.y_rot(), current.x_rot() - look_step),
+        KeyCode::Down => (current.y_rot(), current.x_rot() + look_step),
+        KeyCode::Char('c') => {
+            bot.set_crouching(!bot.crouching())?;
+            return Ok(true);
+        }
+        _ => return Ok(true),
+    };
+    bot.set_direction(yaw, pitch)?;
+    Ok(true)
+}
+
+struct TerminalSession {
+    output: io::Stdout,
+}
+
+impl TerminalSession {
+    fn enter() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        let mut output = io::stdout();
+        execute!(output, EnterAlternateScreen, Hide, Clear(ClearType::All))?;
+        Ok(Self { output })
+    }
+
+    fn draw(&mut self, frame: &Frame, status: &str) -> Result<()> {
+        let mut bytes = String::with_capacity(frame.width * frame.sample_height * 22);
+        bytes.push_str("\x1b[H\x1b[0m\x1b[2K");
+        bytes.push_str(status);
+        bytes.push_str("\r\n\x1b[2K");
+        bytes.push_str(
+            "WASD move · Shift+W sprint · arrows look · Space jump/swim · X stop · C crouch · Q quit",
+        );
+        bytes.push_str("\x1b[0m\r\n");
+
+        for row in 0..(frame.sample_height / 2) {
+            for column in 0..frame.width {
+                append_half_block(
+                    &mut bytes,
+                    frame.pixel(column, row * 2),
+                    frame.pixel(column, row * 2 + 1),
+                );
+            }
+            bytes.push_str("\x1b[0m\r\n");
+        }
+        self.output.write_all(bytes.as_bytes())?;
+        self.output.flush()?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = execute!(self.output, Show, LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn append_half_block(output: &mut String, top: Rgb, bottom: Rgb) {
+    use std::fmt::Write;
+
+    let _ = write!(
+        output,
+        "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
+        top.r, top.g, top.b, bottom.r, bottom.g, bottom.b
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn half_block_uses_independent_foreground_and_background() {
+        let mut encoded = String::new();
+        append_half_block(&mut encoded, Rgb::new(1, 2, 3), Rgb::new(4, 5, 6));
+        assert_eq!(encoded, "\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m▀");
+    }
+}

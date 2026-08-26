@@ -1,0 +1,17 @@
+[package]
+name = "mctui"
+version = "0.1.0"
+edition = "2024"
+description = "A live Minecraft Java world renderer for ANSI terminals"
+license = "MIT"
+
+[dependencies]
+# crates.io's latest release still targets Minecraft 26.1. Pin Azalea's
+# 26.2-compatible upstream revision until that release is published.
+azalea = { git = "https://github.com/azalea-rs/azalea.git", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+crossterm = "0.29.0"
+eyre = "0.6.12"
+tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread", "time"] }
+
+[profile.release]
+debug = "line-tables-only"
