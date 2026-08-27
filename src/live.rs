@@ -21,6 +21,8 @@ use azalea::{
 };
 use eyre::{Result, bail};
 
+use crate::hud::HudSnapshot;
+
 use mctui::{
     Block, BlockPos, BlockSource, Camera, EntityCategory, EntityMarker, LightLevels, RayResult,
     RenderConfig, Vec3, Voxel,
@@ -264,6 +266,9 @@ impl BlockSource for AzaleaWorld<'_> {
 /// client-world updates.
 pub(crate) type EntitySnapshots = Arc<RwLock<Vec<EntityMarker>>>;
 
+/// Shared packet-backed player HUD state for the terminal renderer.
+pub(crate) type HudSnapshots = Arc<RwLock<HudSnapshot>>;
+
 /// Capture nearby streamed entities for the renderer.
 ///
 /// This runs from Azalea's event handler instead of the terminal thread. It
@@ -375,6 +380,7 @@ pub struct AppState {
     renderer_started: Arc<AtomicBool>,
     lighting: Arc<RwLock<LightStore>>,
     entity_snapshots: EntitySnapshots,
+    hud: HudSnapshots,
 }
 
 impl AppState {
@@ -384,6 +390,7 @@ impl AppState {
             renderer_started: Arc::new(AtomicBool::new(false)),
             lighting: Arc::new(RwLock::new(LightStore::default())),
             entity_snapshots: Arc::new(RwLock::new(Vec::new())),
+            hud: Arc::new(RwLock::new(HudSnapshot::default())),
         }
     }
 }
@@ -437,6 +444,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 .write()
                 .expect("entity snapshot lock poisoned")
                 .clear();
+            *state.hud.write().expect("HUD snapshot lock poisoned") = HudSnapshot::default();
             println!("Login accepted; waiting for spawn and chunks...");
         }
         Event::Spawn => {
@@ -448,6 +456,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 let config = state.config.clone();
                 let lighting = state.lighting.clone();
                 let entity_snapshots = state.entity_snapshots.clone();
+                let hud = state.hud.clone();
                 std::thread::spawn(move || {
                     if let Err(error) = crate::terminal::run(
                         render_bot.clone(),
@@ -456,6 +465,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                         lighting,
                         config.render_entities,
                         entity_snapshots,
+                        hud,
                     ) {
                         eprintln!("terminal renderer stopped: {error:?}");
                         render_bot.exit();
@@ -463,7 +473,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 });
             }
         }
-        Event::Packet(packet) => capture_protocol_data(&bot, &state.lighting, &packet),
+        Event::Packet(packet) => capture_protocol_data(&bot, &state.lighting, &state.hud, &packet),
         Event::Chat(chat) => println!("chat: {}", chat.message().to_ansi()),
         Event::Tick => {
             if state.config.mode == Mode::Render
@@ -522,6 +532,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
 fn capture_protocol_data(
     bot: &Client,
     store: &Arc<RwLock<LightStore>>,
+    hud: &HudSnapshots,
     packet: &azalea::protocol::packets::game::ClientboundGamePacket,
 ) {
     use azalea::protocol::packets::game::ClientboundGamePacket;
@@ -569,8 +580,67 @@ fn capture_protocol_data(
                 apply_light_packet(store, packet.x, packet.z, min_y, &packet.light_data);
             }
         }
+        ClientboundGamePacket::SetHealth(packet) => {
+            hud.write()
+                .expect("HUD snapshot lock poisoned")
+                .set_health(packet.health, packet.food);
+        }
+        ClientboundGamePacket::SetExperience(packet) => {
+            hud.write()
+                .expect("HUD snapshot lock poisoned")
+                .set_experience(packet.experience_progress, packet.experience_level);
+        }
+        ClientboundGamePacket::SetHeldSlot(packet) => {
+            hud.write()
+                .expect("HUD snapshot lock poisoned")
+                .set_selected_hotbar_slot(packet.slot as usize);
+        }
+        ClientboundGamePacket::ContainerSetContent(packet) if packet.container_id == 0 => {
+            let mut hud = hud.write().expect("HUD snapshot lock poisoned");
+            for (slot, item) in packet.items.iter().enumerate() {
+                update_hud_player_menu_slot(&mut hud, slot, item);
+            }
+        }
+        ClientboundGamePacket::ContainerSetSlot(packet)
+            if matches!(packet.container_id, -2 | 0) =>
+        {
+            update_hud_player_menu_slot(
+                &mut hud.write().expect("HUD snapshot lock poisoned"),
+                usize::from(packet.slot),
+                &packet.item_stack,
+            );
+        }
+        ClientboundGamePacket::SetPlayerInventory(packet) => {
+            let mut hud = hud.write().expect("HUD snapshot lock poisoned");
+            let slot = packet.slot as usize;
+            if slot <= 8 {
+                update_hud_hotbar_slot(&mut hud, slot, &packet.contents);
+            } else {
+                update_hud_player_menu_slot(&mut hud, slot, &packet.contents);
+            }
+        }
         _ => {}
     }
+}
+
+fn update_hud_player_menu_slot(
+    hud: &mut HudSnapshot,
+    slot: usize,
+    item: &azalea::inventory::ItemStack,
+) {
+    hud.set_player_menu_slot(
+        slot,
+        item.is_present().then(|| item.kind().to_str()),
+        item.count(),
+    );
+}
+
+fn update_hud_hotbar_slot(hud: &mut HudSnapshot, slot: usize, item: &azalea::inventory::ItemStack) {
+    hud.set_hotbar_slot(
+        slot,
+        item.is_present().then(|| item.kind().to_str()),
+        item.count(),
+    );
 }
 
 fn world_min_y(bot: &Client) -> Option<i32> {

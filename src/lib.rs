@@ -507,6 +507,24 @@ impl Frame {
         self.pixels[y * self.width + x]
     }
 
+    /// Overlay a small, high-contrast crosshair at the centre of the frame.
+    ///
+    /// The terminal presenter calls this after rendering terrain and entities,
+    /// so the aiming reticle remains legible over every material.
+    pub fn draw_center_crosshair(&mut self) {
+        const RETICLE: Rgb = Rgb::new(255, 245, 210);
+
+        let center_x = self.width as isize / 2;
+        let center_y = self.sample_height as isize / 2;
+        for (offset_x, offset_y) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let x = center_x + offset_x;
+            let y = center_y + offset_y;
+            if x >= 0 && x < self.width as isize && y >= 0 && y < self.sample_height as isize {
+                self.pixels[y as usize * self.width + x as usize] = RETICLE;
+            }
+        }
+    }
+
     /// Render a frame from the supplied loaded-world view.
     pub fn render(source: &impl BlockSource, camera: Camera, config: RenderConfig) -> Self {
         Self::render_with_entities(source, camera, config, &[])
@@ -1079,6 +1097,25 @@ mod tests {
         let walled = Frame::render(&walled_world, camera, config);
         let hidden = Frame::render_with_entities(&walled_world, camera, config, &[marker]);
         assert_eq!(hidden.pixels, walled.pixels);
+    }
+
+    #[test]
+    fn center_crosshair_overlays_only_the_reticle_pixels() {
+        let background = Rgb::new(10, 20, 30);
+        let reticle = Rgb::new(255, 245, 210);
+        let mut frame = Frame {
+            width: 5,
+            sample_height: 5,
+            pixels: vec![background; 25],
+        };
+
+        frame.draw_center_crosshair();
+
+        for (x, y) in [(2, 2), (1, 2), (3, 2), (2, 1), (2, 3)] {
+            assert_eq!(frame.pixel(x, y), reticle);
+        }
+        assert_eq!(frame.pixel(0, 0), background);
+        assert_eq!(frame.pixel(4, 4), background);
     }
 
     #[test]

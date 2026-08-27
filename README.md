@@ -23,6 +23,8 @@ coloured pixels.
 - Packet-backed block light, sky light, and server time-of-day
 - Water, glass, ice, and lava transparency with camera-underwater overlays
 - Interactive movement, sprinting, jumping, crouching, and look controls
+- Centre crosshair and live target HUD with block, face, distance, and light data
+- Packet-backed health, hunger, XP, and selected nine-slot hotbar HUD
 - 15×15 navigation minimap that projects nearby terrain below the player
 - Conservative unloaded-chunk handling: unknown terrain is never rendered as sky
 

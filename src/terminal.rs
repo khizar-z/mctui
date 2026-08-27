@@ -19,15 +19,24 @@ use crossterm::{
 };
 use eyre::Result;
 
-use mctui::{Camera, Frame, RenderConfig, Rgb, lighting::LightStore, navigation_minimap};
+use mctui::{
+    BlockSource, Camera, Frame, RayResult, RenderConfig, Rgb, lighting::LightStore,
+    navigation_minimap, raycast,
+};
 
-use crate::live::EntitySnapshots;
+use crate::{
+    hud::HudSnapshot,
+    live::{EntitySnapshots, HudSnapshots},
+};
 
 const MINIMAP_RADIUS: i32 = 7;
 const MINIMAP_WIDTH: usize = (MINIMAP_RADIUS as usize * 2) + 1;
 const MINIMAP_SIDEBAR_COLUMNS: usize = MINIMAP_WIDTH + 4; // gap, borders, and map cells
 const MINIMAP_ROWS: usize = MINIMAP_WIDTH + 4; // title, borders, cells, legend
 const MIN_RENDER_COLUMNS: usize = 20;
+const HEADER_ROWS: usize = 3;
+const HUD_ROWS: usize = 2;
+const CHROME_ROWS: usize = HEADER_ROWS + HUD_ROWS;
 const LOOK_STEP_DEGREES: f32 = 6.0;
 
 /// Run the interactive renderer until the user presses `q` or Escape.
@@ -38,10 +47,12 @@ pub fn run(
     lighting: Arc<RwLock<LightStore>>,
     render_entities: bool,
     entity_snapshots: EntitySnapshots,
+    hud_snapshots: HudSnapshots,
 ) -> Result<()> {
     let mut session = TerminalSession::enter()?;
     let layout = session.layout_for(config);
     config.width = layout.frame_width;
+    config.height = layout.frame_height;
     let frame_period = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
     let mut last_frame_at = Instant::now();
     let mut frames = 0_u32;
@@ -75,10 +86,14 @@ pub fn run(
         } else {
             Vec::new()
         };
+        let hud = hud_snapshots
+            .read()
+            .expect("HUD snapshot lock poisoned")
+            .clone();
 
         // Keep one read lock for the entire frame so every ray samples a
         // coherent snapshot of chunks that Azalea has already received.
-        let (frame, minimap) = {
+        let (mut frame, minimap, target) = {
             let world = bot.world()?;
             let world = world.read();
             let lighting = lighting.read().expect("lighting cache lock poisoned");
@@ -92,8 +107,10 @@ pub fn run(
                     MINIMAP_RADIUS,
                 )
             });
-            (frame, minimap)
+            let target = target_readout(&live_world, camera, config.max_distance);
+            (frame, minimap, target)
         };
+        frame.draw_center_crosshair();
 
         frames += 1;
         let elapsed = fps_window.elapsed();
@@ -113,6 +130,8 @@ pub fn run(
                 direction.y_rot(),
                 direction.x_rot(),
             ),
+            &target,
+            &hud,
             minimap.as_deref(),
         )?;
 
@@ -124,6 +143,26 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn target_readout(source: &impl BlockSource, camera: Camera, max_distance: f64) -> String {
+    let (forward, _, _) = camera.basis();
+    match raycast(source, camera.origin, forward, max_distance) {
+        RayResult::Hit(hit) => {
+            let light = source.light_at(hit.position);
+            let face = hit
+                .entered_face
+                .map_or_else(|| "inside".to_owned(), |face| format!("{face:?}"));
+            format!(
+                "target: {} @ {}  {:.1}m  {face}  light {}/{}",
+                hit.block.id, hit.position, hit.distance, light.block, light.sky
+            )
+        }
+        RayResult::Miss => format!("target: sky (no block within {max_distance:.0}m)"),
+        RayResult::Unloaded { position, distance } => {
+            format!("target: unloaded at {position} after {distance:.1}m")
+        }
+    }
 }
 
 fn read_input(bot: &Client) -> Result<bool> {
@@ -205,6 +244,7 @@ struct TerminalSession {
 #[derive(Clone, Copy)]
 struct RenderLayout {
     frame_width: usize,
+    frame_height: usize,
     show_minimap: bool,
 }
 
@@ -242,11 +282,15 @@ impl TerminalSession {
     }
 
     fn layout_for(&self, config: RenderConfig) -> RenderLayout {
-        let columns = terminal::size()
-            .map(|(columns, _)| columns as usize)
-            .unwrap_or(config.width + MINIMAP_SIDEBAR_COLUMNS);
-        let show_minimap = config.height >= MINIMAP_ROWS
-            && columns >= MIN_RENDER_COLUMNS + MINIMAP_SIDEBAR_COLUMNS;
+        let (columns, rows) = terminal::size()
+            .map(|(columns, rows)| (columns as usize, rows as usize))
+            .unwrap_or((
+                config.width + MINIMAP_SIDEBAR_COLUMNS,
+                config.height + CHROME_ROWS,
+            ));
+        let frame_height = config.height.min(rows.saturating_sub(CHROME_ROWS).max(1));
+        let show_minimap =
+            frame_height >= MINIMAP_ROWS && columns >= MIN_RENDER_COLUMNS + MINIMAP_SIDEBAR_COLUMNS;
         let frame_width = if show_minimap {
             config
                 .width
@@ -256,15 +300,25 @@ impl TerminalSession {
         };
         RenderLayout {
             frame_width,
+            frame_height,
             show_minimap,
         }
     }
 
-    fn draw(&mut self, frame: &Frame, status: &str, minimap: Option<&str>) -> Result<()> {
+    fn draw(
+        &mut self,
+        frame: &Frame,
+        status: &str,
+        target: &str,
+        hud: &HudSnapshot,
+        minimap: Option<&str>,
+    ) -> Result<()> {
         let minimap_rows: Vec<_> = minimap.map_or_else(Vec::new, |map| map.lines().collect());
         let mut bytes = String::with_capacity(frame.width * frame.sample_height * 22);
         bytes.push_str("\x1b[H\x1b[0m\x1b[2K");
         bytes.push_str(status);
+        bytes.push_str("\r\n\x1b[2K");
+        bytes.push_str(target);
         bytes.push_str("\r\n\x1b[2K");
         bytes.push_str(if self.reports_key_releases {
             "WASD move/release stop · Shift+W sprint · arrows look · Space jump/swim · X stop · C crouch · Q quit"
@@ -284,9 +338,19 @@ impl TerminalSession {
             append_minimap_sidebar(&mut bytes, row, &minimap_rows);
             bytes.push_str("\x1b[0m\x1b[K\r\n");
         }
+        append_hud_line(&mut bytes, &hud.status_line(), true);
+        append_hud_line(&mut bytes, &hud.hotbar_line(), false);
         self.output.write_all(bytes.as_bytes())?;
         self.output.flush()?;
         Ok(())
+    }
+}
+
+fn append_hud_line(output: &mut String, line: &str, newline: bool) {
+    output.push_str("\x1b[0m\x1b[2K");
+    output.push_str(line);
+    if newline {
+        output.push_str("\r\n");
     }
 }
 
