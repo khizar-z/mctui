@@ -142,18 +142,21 @@ pub fn run(
         let render_ms = frame_started.elapsed().as_secs_f32() * 1_000.0;
         session.draw(
             &frame,
-            &format!(
+            DrawView {
+                status: &format!(
                 "mctui  {fps:>4.1} fps  {render_ms:>5.1} ms  pos {:.1} {:.1} {:.1}  yaw {:.1} pitch {:.1}",
                 position.x,
                 position.y,
                 position.z,
                 direction.y_rot(),
                 direction.x_rot(),
-            ),
-            &target,
-            &hud,
-            minimap.as_deref(),
-            inventory_ui.open.then_some(&inventory_ui),
+                ),
+                target: &target,
+                hud: &hud,
+                minimap: minimap.as_deref(),
+                inventory_ui: inventory_ui.open.then_some(&inventory_ui),
+                text_columns: layout.text_columns,
+            },
         )?;
 
         let remaining = frame_period.saturating_sub(last_frame_at.elapsed());
@@ -415,6 +418,18 @@ struct RenderLayout {
     frame_width: usize,
     frame_height: usize,
     show_minimap: bool,
+    /// Keep one terminal column unused: writing in the final column can
+    /// trigger delayed wrapping in several terminal emulators.
+    text_columns: usize,
+}
+
+struct DrawView<'a> {
+    status: &'a str,
+    target: &'a str,
+    hud: &'a HudSnapshot,
+    minimap: Option<&'a str>,
+    inventory_ui: Option<&'a InventoryUi>,
+    text_columns: usize,
 }
 
 impl TerminalSession {
@@ -457,50 +472,50 @@ impl TerminalSession {
                 config.width + MINIMAP_SIDEBAR_COLUMNS,
                 config.height + CHROME_ROWS,
             ));
+        let text_columns = columns.saturating_sub(1).max(1);
         let frame_height = config.height.min(rows.saturating_sub(CHROME_ROWS).max(1));
-        let show_minimap =
-            frame_height >= MINIMAP_ROWS && columns >= MIN_RENDER_COLUMNS + MINIMAP_SIDEBAR_COLUMNS;
+        let show_minimap = frame_height >= MINIMAP_ROWS
+            && text_columns >= MIN_RENDER_COLUMNS + MINIMAP_SIDEBAR_COLUMNS;
         let frame_width = if show_minimap {
             config
                 .width
-                .min(columns.saturating_sub(MINIMAP_SIDEBAR_COLUMNS))
+                .min(text_columns.saturating_sub(MINIMAP_SIDEBAR_COLUMNS))
         } else {
-            config.width.min(columns.max(1))
+            config.width.min(text_columns)
         };
         RenderLayout {
             frame_width,
             frame_height,
             show_minimap,
+            text_columns,
         }
     }
 
-    fn draw(
-        &mut self,
-        frame: &Frame,
-        status: &str,
-        target: &str,
-        hud: &HudSnapshot,
-        minimap: Option<&str>,
-        inventory_ui: Option<&InventoryUi>,
-    ) -> Result<()> {
-        let minimap_rows: Vec<_> = minimap.map_or_else(Vec::new, |map| map.lines().collect());
+    fn draw(&mut self, frame: &Frame, view: DrawView<'_>) -> Result<()> {
+        let minimap_rows: Vec<_> = view
+            .minimap
+            .map_or_else(Vec::new, |map| map.lines().collect());
         let mut bytes = String::with_capacity(frame.width * frame.sample_height * 22);
-        bytes.push_str("\x1b[H\x1b[0m\x1b[2K");
-        bytes.push_str(status);
-        bytes.push_str("\r\n\x1b[2K");
-        bytes.push_str(target);
-        bytes.push_str("\r\n\x1b[2K");
-        bytes.push_str(if inventory_ui.is_some() {
+        bytes.push_str("\x1b[H");
+        append_text_line(&mut bytes, view.status, view.text_columns, true);
+        append_text_line(&mut bytes, view.target, view.text_columns, true);
+        let controls = if view.inventory_ui.is_some() {
             "inventory: arrows select storage · Tab select equipment/craft · Enter pick/place · Shift+Enter move stack · R split/place one · E/Esc close · Q quit"
         } else if self.reports_key_releases {
             "WASD move/release stop · Shift+W sprint · arrows look · Space jump/swim · F break · G use/place · 1-9 hotbar · E inventory · Q quit"
         } else {
             "WASD move · Shift+W sprint · arrows look · Space jump/swim · F break · G use/place · 1-9 hotbar · E inventory · Q quit"
-        });
-        bytes.push_str("\x1b[0m\r\n");
+        };
+        append_text_line(&mut bytes, controls, view.text_columns, true);
 
-        if let Some(inventory_ui) = inventory_ui {
-            append_inventory_overlay(&mut bytes, hud, inventory_ui, frame.sample_height / 2);
+        if let Some(inventory_ui) = view.inventory_ui {
+            append_inventory_overlay(
+                &mut bytes,
+                view.hud,
+                inventory_ui,
+                frame.sample_height / 2,
+                view.text_columns,
+            );
         } else {
             for row in 0..(frame.sample_height / 2) {
                 for column in 0..frame.width {
@@ -514,8 +529,13 @@ impl TerminalSession {
                 bytes.push_str("\x1b[0m\x1b[K\r\n");
             }
         }
-        append_hud_line(&mut bytes, &hud.status_line(), true);
-        append_hud_line(&mut bytes, &hud.hotbar_line(), false);
+        append_text_line(&mut bytes, &view.hud.status_line(), view.text_columns, true);
+        append_text_line(
+            &mut bytes,
+            &view.hud.hotbar_line(),
+            view.text_columns,
+            false,
+        );
         self.output.write_all(bytes.as_bytes())?;
         self.output.flush()?;
         Ok(())
@@ -527,6 +547,7 @@ fn append_inventory_overlay(
     hud: &HudSnapshot,
     inventory_ui: &InventoryUi,
     rows: usize,
+    text_columns: usize,
 ) {
     let selected_slot = inventory_ui.selected_slot();
     let cell = |slot| hud.inventory_cell(slot, slot == selected_slot);
@@ -566,17 +587,17 @@ fn append_inventory_overlay(
     ];
 
     for row in 0..rows {
-        output.push_str("\x1b[0m\x1b[2K");
         if let Some(line) = lines.get(row) {
-            output.push_str(line);
+            append_text_line(output, line, text_columns, true);
+        } else {
+            append_text_line(output, "", text_columns, true);
         }
-        output.push_str("\r\n");
     }
 }
 
-fn append_hud_line(output: &mut String, line: &str, newline: bool) {
+fn append_text_line(output: &mut String, line: &str, text_columns: usize, newline: bool) {
     output.push_str("\x1b[0m\x1b[2K");
-    output.push_str(line);
+    output.extend(line.chars().take(text_columns));
     if newline {
         output.push_str("\r\n");
     }
@@ -661,9 +682,17 @@ mod tests {
         let inventory = InventoryUi::default();
         let mut output = String::new();
 
-        append_inventory_overlay(&mut output, &hud, &inventory, 9);
+        append_inventory_overlay(&mut output, &hud, &inventory, 9, 79);
 
         assert!(output.contains(">ST64<"));
         assert!(output.contains("server-synced player inventory"));
+    }
+
+    #[test]
+    fn text_lines_are_clipped_before_the_terminal_wrap_column() {
+        let mut output = String::new();
+        append_text_line(&mut output, "12345", 4, false);
+
+        assert_eq!(output, "\x1b[0m\x1b[2K1234");
     }
 }
