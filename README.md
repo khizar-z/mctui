@@ -1,64 +1,72 @@
-
 # mctui
 
-**A live first-person Minecraft Java renderer for the terminal.**
+**A live first-person Minecraft Java renderer for the terminal, written in Rust.**
 
 <img width="800" height="519" alt="2026-08-2602-01-08-ezgif com-speed" src="https://github.com/user-attachments/assets/330568b6-eb5b-4371-8db9-a626832f2755" />
 
-`mctui` connects to a local Minecraft server as a client, consumes the chunks
-and lighting data it receives, and renders the world as a 24-bit ANSI view in
-real time. It is written in Rust and uses a custom voxel raycaster rather than
-capturing or proxying the official game client.
+`mctui` connects to a local Minecraft Java server as a real client, consumes
+its streamed world state, and renders a playable first-person view in a
+true-colour ANSI terminal. It does not capture, proxy, or automate the
+official game client: terrain is raycast directly from streamed voxel data
+with a custom renderer.
 
-The project is a systems-focused exploration of real-time rendering on a text
-terminal: networking state arrives asynchronously, blocks are raycast through
-a streamed voxel world, and each terminal cell represents two independently
-coloured pixels.
+The project explores the systems work behind a real-time text-mode renderer:
+asynchronous networking, compact lighting data, voxel traversal, terminal I/O,
+and safe synchronization between the game client and rendering thread.
 
 ## Highlights
 
-- Live Minecraft Java world data via [Azalea](https://github.com/azalea-rs/azalea)
-- Custom Amanatides & Woo DDA voxel raycaster
-- 24-bit ANSI rendering using foreground/background half-block characters
-- Packet-backed block light, sky light, and server time-of-day
-- Water, glass, ice, and lava transparency with camera-underwater overlays
-- Interactive movement, sprinting, jumping, crouching, and look controls
-- Centre crosshair and live target HUD with block, face, distance, and light data
-- Packet-backed health, hunger, XP, selected hotbar, and underwater air meter
-- Targeted server-authoritative block breaking, block use, and placement
-- Keyboard-driven, server-synchronised player inventory with stack and split actions
-- 15×15 navigation minimap that projects nearby terrain below the player
-- Conservative unloaded-chunk handling: unknown terrain is never rendered as sky
+- Streams local Minecraft Java world data through [Azalea](https://github.com/azalea-rs/azalea)
+- Casts every view ray with a custom Amanatides & Woo DDA voxel raycaster
+- Renders 24-bit colour at double vertical resolution with ANSI half blocks
+- Uses packet-backed sky light, block light, and a smoothly advancing server clock
+- Keeps lighting coherent when chunks stream, blocks change, and light updates arrive separately
+- Handles water, glass, ice, and lava as translucent layers, including underwater overlays
+- Provides live target data, navigation minimap, health, hunger, XP, hotbar, and drowning HUDs
+- Supports movement, sprinting, swimming, block breaking, block use/placement, and hotbar selection
+- Includes a keyboard-driven, server-synchronised player inventory overlay
+- Treats unloaded terrain conservatively instead of rendering unknown blocks as empty sky
 
 ```text
-Minecraft packets → streamed chunk state + light cache → DDA raycaster → ANSI terminal frame
+Minecraft packets → streamed blocks + light/clock sidecars → DDA raycaster → ANSI terminal frame
 ```
 
 ## Quick start
 
-### Prerequisites
+### Requirements
 
-- Rust nightly, selected automatically by the included
-  [`rust-toolchain.toml`](rust-toolchain.toml)
+- Rust nightly; the included [`rust-toolchain.toml`](rust-toolchain.toml) selects the tested toolchain
 - A local Minecraft Java server compatible with Minecraft `26.2`
-- A true-colour ANSI terminal (Kitty, iTerm2, WezTerm, Ghostty, macOS Terminal,
-  and most modern Linux terminals work)
+- A true-colour ANSI terminal, such as Kitty, iTerm2, WezTerm, Ghostty, or a modern Linux terminal
 
-Start the server separately, then run mctui from this repository. The default
-connection is an offline-mode local server at `127.0.0.1:25565`.
+Start the server separately, then run mctui from this repository. By default,
+it connects in offline mode to `127.0.0.1:25565` as `mctui`.
 
 ```sh
 cargo run --release -- --mode render
 ```
 
-Use a distinct username when another local player is already connected:
+Use another name when a local player is already using `mctui`:
 
 ```sh
 cargo run --release -- --username terminal_view --mode render
 ```
 
-The client rejects non-loopback server addresses unless
-`--allow-public-server` is supplied explicitly.
+For a larger, farther-reaching view:
+
+```sh
+cargo run --release -- --mode render \
+  --width 120 --height 36 --fps 10 \
+  --view-distance 12 --distance 80
+```
+
+`--width` and `--height` control the rendered viewport. The minimap occupies
+19 additional terminal columns, so the example above is most comfortable in a
+terminal around 140 columns wide. Lower `--fps` or `--distance` if rendering
+becomes expensive.
+
+The client rejects non-loopback addresses unless `--allow-public-server` is
+passed explicitly. Only connect it to servers that permit bots.
 
 ## Controls
 
@@ -76,90 +84,83 @@ The client rejects non-loopback server addresses unless
 | `E` | Open or close the player inventory |
 | `Q` or `Esc` | Quit |
 
-In terminals that support Kitty keyboard enhancement, releasing a movement key
-also stops movement. `X` is always available as a terminal-independent stop.
+When the terminal reports Kitty keyboard-enhancement key releases, releasing a
+movement key also stops the player. `X` is the portable stop control and works
+in every supported terminal.
 
 ### Inventory controls
 
-The inventory shows the server-synchronised player slots and the current cursor
-stack. It is a keyboard overlay, so it remains usable in a pure terminal.
+The inventory overlay reflects server-synchronised player slots and the carried
+stack; it does not simulate an independent local inventory.
 
 | Input | Action |
 | --- | --- |
-| Arrow keys | Move the selection across the 27 main-inventory and 9 hotbar slots |
-| `Tab` / `Shift` + `Tab` | Cycle crafting, output, armor, and offhand slots |
+| Arrow keys | Select a main-inventory or hotbar slot |
+| `Tab` / `Shift` + `Tab` | Cycle crafting, armor, and offhand slots |
 | `Enter` | Pick up, place, merge, or swap a stack |
 | `Shift` + `Enter` | Quick-move the selected stack |
 | `R` | Right-click equivalent: split a stack or place one item |
-| `E` or `Esc` | Close the inventory overlay |
+| `E` or `Esc` | Close the overlay |
 
-## Recommended command
+## Command line
 
-This setting combines a larger viewport with terrain streamed and raycast
-farther from the player:
-
-```sh
-cargo run --release -- --mode render \
-  --width 120 --height 36 --fps 10 \
-  --view-distance 12 --distance 80
+```text
+mctui [options]
 ```
-
-Increase `--width` and `--height` for more detail; lower `--fps` or
-`--distance` if rendering becomes too expensive. The navigation minimap uses
-19 additional terminal columns, so a 120-column viewport needs a terminal
-roughly 140 columns wide.
-
-## CLI reference
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--server <HOST:PORT>` | `127.0.0.1:25565` | Minecraft server address |
-| `--username <NAME>` | `mctui` | In-game username |
-| `--mode <MODE>` | `render` | `monitor`, `minimap`, `ray`, or interactive `render` |
+| `--username <NAME>` | `mctui` | Offline name, or Microsoft-account email with `--online` |
+| `--mode <MODE>` | `render` | `monitor`, `minimap`, `ray`, or `render` |
 | `--width <COLS>` | `80` | Rendered viewport width in terminal columns |
 | `--height <ROWS>` | `24` | Rendered viewport height in terminal rows |
 | `--fps <FPS>` | `12` | Target interactive frame rate |
 | `--distance <BLOCKS>` | `48` | Maximum DDA ray distance |
 | `--fov <DEGREES>` | `75` | Horizontal field of view |
-| `--view-distance <CHUNKS>` | `8` | Requested server view distance |
+| `--view-distance <CHUNKS>` | `8` | Requested server chunk-view distance |
 | `--entities` | off | Enable experimental nearby-entity markers |
-| `--online` | off | Use online authentication instead of offline mode |
+| `--online` | off | Use Microsoft authentication instead of offline mode |
 | `--allow-public-server` | off | Permit a non-loopback server address |
 
-Run `cargo run --release -- --help` for the authoritative list of options.
-
-### Render modes
+The diagnostic modes are useful when working on one pipeline at a time:
 
 | Mode | Purpose |
 | --- | --- |
-| `monitor` | Connection and player-position diagnostics |
-| `minimap` | Top-down view of the loaded terrain around the player |
-| `ray` | Inspect the first block encountered by a camera ray |
-| `render` | Interactive first-person terminal renderer |
+| `monitor` | Verifies connection, player position, light, and clock updates |
+| `minimap` | Prints a top-down view of the loaded terrain layer |
+| `ray` | Reports the first block reached by a forward camera ray |
+| `render` | Starts the interactive first-person terminal renderer |
 
-## How it works
+Run `cargo run --release -- --help` for the authoritative option list.
 
-### World and lighting
+## Rendering pipeline
 
-Azalea provides the streamed world state used to query block data. mctui also
-maintains a packet-backed sidecar cache for chunk lighting and server time.
-Packed block-light and sky-light arrays are combined with a time-of-day sky
-curve to shade surfaces using the same information the server sends to clients.
+### Streamed world state
 
-### Raycasting and colour
+Azalea supplies the locally streamed chunks used for block queries. mctui keeps
+small packet-backed sidecars for data the block world does not own: sky light,
+block light, server time, HUD state, and short-lived block-update bridges. A
+block update invalidates only its stale light sample until its corresponding
+light packet arrives, avoiding dark artifacts without replacing the server as
+the lighting authority.
 
-Each frame casts camera rays through blocks using the Amanatides & Woo DDA
-algorithm. Rays distinguish among a solid hit, confirmed open sky, and an
-unloaded or unknown region. The last case renders dark rather than pretending
-the missing data is empty space. A compact material palette, directional
-shading, fog, and light values produce the final colours.
+### Voxel rendering
+
+Each frame generates camera rays and advances them through the voxel grid with
+DDA. A ray can hit an opaque block, collect a bounded number of translucent
+layers, reach open sky, or enter an unloaded region. The last case is rendered
+as unknown terrain rather than fabricated sky. Face orientation, light,
+time-of-day, distance fog, and a compact material palette produce the final
+pixel colour.
 
 ### Terminal output
 
-Terminal rows are rendered with the Unicode upper-half-block character: its
-foreground colour is the upper pixel and its background colour is the lower
-pixel. That gives a 2× vertical effective pixel density while preserving full
-24-bit ANSI colour.
+Each terminal cell uses the Unicode upper-half-block character. Its foreground
+colour encodes one pixel and its background colour encodes the next, giving the
+view a 2× vertical effective resolution while retaining full 24-bit ANSI
+colour. Output is drawn in an alternate screen and deliberately avoids the
+last terminal column, which prevents soft-wrap artifacts in common emulators.
 
 ## Development
 
@@ -170,21 +171,16 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-`monitor`, `minimap`, and `ray` are deliberately small diagnostic modes that
-make it easier to validate networking, streamed-world data, and raycasting
-without running the full renderer.
+The small diagnostic modes make it possible to validate networking, world
+sampling, ray traversal, and terminal rendering independently without running
+the full interactive renderer.
 
-## Scope and safety
+## Scope and limitations
 
-mctui is a local-world renderer with a small set of direct, player-triggered
-interactions: movement, targeted breaking/using/placing, hotbar selection, and
-player-inventory clicks. It does not craft, fight, or automate gameplay. The
-default local-only connection policy is intentional. If you use
-`--allow-public-server`, follow that server's rules and obtain permission.
+mctui is a local-world renderer with direct, player-triggered interactions. It
+does not craft, fight, pathfind, or automate gameplay. The local-only default
+is intentional.
 
-## Current limitations
-
-- The material palette is intentionally compact, so some blocks share colours.
-- The renderer can only display chunks the server has sent to the client.
-- Nearby-entity markers are experimental and disabled by default while their
-  world-state integration is being reworked.
+- The material palette is compact, so some block types share colours.
+- The renderer can only show chunks and lighting the server has provided.
+- Nearby-entity markers remain experimental and are disabled by default.
