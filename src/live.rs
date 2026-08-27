@@ -1,6 +1,7 @@
 //! Azalea integration and the phase-oriented runtime modes.
 
 use std::{
+    collections::HashMap,
     env, fmt,
     net::IpAddr,
     str::FromStr,
@@ -228,25 +229,38 @@ proves the DDA ray; render starts the interactive half-block view."
 pub struct AzaleaWorld<'a> {
     world: &'a azalea::world::World,
     lighting: &'a LightStore,
+    block_overrides: &'a HashMap<BlockPos, BlockOverride>,
 }
 
 impl<'a> AzaleaWorld<'a> {
-    pub fn new(world: &'a azalea::world::World, lighting: &'a LightStore) -> Self {
-        Self { world, lighting }
+    pub fn new(
+        world: &'a azalea::world::World,
+        lighting: &'a LightStore,
+        block_overrides: &'a HashMap<BlockPos, BlockOverride>,
+    ) -> Self {
+        Self {
+            world,
+            lighting,
+            block_overrides,
+        }
     }
 }
 
 impl BlockSource for AzaleaWorld<'_> {
     fn voxel_at(&self, position: BlockPos) -> Voxel {
+        if let Some(block) = self.block_overrides.get(&position) {
+            return match block {
+                BlockOverride::Air => Voxel::Air,
+                BlockOverride::Solid(id) => Voxel::Solid(Block { id }),
+            };
+        }
         let position = azalea::BlockPos::new(position.x, position.y, position.z);
         let Some(state) = self.world.get_block_state(position) else {
             return Voxel::Unloaded;
         };
-        let id = state.to_trait().id();
-        if matches!(id, "air" | "cave_air" | "void_air") {
-            Voxel::Air
-        } else {
-            Voxel::Solid(Block { id })
+        match block_override_from_id(state.to_trait().id()) {
+            BlockOverride::Air => Voxel::Air,
+            BlockOverride::Solid(id) => Voxel::Solid(Block { id }),
         }
     }
 
@@ -273,6 +287,19 @@ pub(crate) type EntitySnapshots = Arc<RwLock<Vec<EntityMarker>>>;
 
 /// Shared packet-backed player HUD state for the terminal renderer.
 pub(crate) type HudSnapshots = Arc<RwLock<HudSnapshot>>;
+
+/// The latest authoritative block states received after a chunk was streamed.
+///
+/// Azalea applies these updates to its shared world on the next ECS update;
+/// this small sidecar closes that transient gap for the renderer without
+/// retaining a world or ECS lock on the terminal thread.
+pub(crate) type BlockOverrides = Arc<RwLock<HashMap<BlockPos, BlockOverride>>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlockOverride {
+    Air,
+    Solid(&'static str),
+}
 
 /// Commands produced by terminal input and executed from Azalea's event loop.
 ///
@@ -412,6 +439,7 @@ pub struct AppState {
     lighting: Arc<RwLock<LightStore>>,
     entity_snapshots: EntitySnapshots,
     hud: HudSnapshots,
+    block_overrides: BlockOverrides,
     action_sender: ActionSender,
     action_receiver: ActionReceiver,
 }
@@ -425,6 +453,7 @@ impl AppState {
             lighting: Arc::new(RwLock::new(LightStore::default())),
             entity_snapshots: Arc::new(RwLock::new(Vec::new())),
             hud: Arc::new(RwLock::new(HudSnapshot::default())),
+            block_overrides: Arc::new(RwLock::new(HashMap::new())),
             action_sender,
             action_receiver: Arc::new(Mutex::new(action_receiver)),
         }
@@ -480,6 +509,11 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 .write()
                 .expect("entity snapshot lock poisoned")
                 .clear();
+            state
+                .block_overrides
+                .write()
+                .expect("block override lock poisoned")
+                .clear();
             *state.hud.write().expect("HUD snapshot lock poisoned") = HudSnapshot::default();
             println!("Login accepted; waiting for spawn and chunks...");
         }
@@ -493,6 +527,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 let lighting = state.lighting.clone();
                 let entity_snapshots = state.entity_snapshots.clone();
                 let hud = state.hud.clone();
+                let block_overrides = state.block_overrides.clone();
                 let action_sender = state.action_sender.clone();
                 std::thread::spawn(move || {
                     if let Err(error) = crate::terminal::run(
@@ -504,6 +539,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                             render_entities: config.render_entities,
                             entity_snapshots,
                             hud_snapshots: hud,
+                            block_overrides,
                             actions: action_sender,
                         },
                     ) {
@@ -513,10 +549,17 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 });
             }
         }
-        Event::Packet(packet) => capture_protocol_data(&bot, &state.lighting, &state.hud, &packet),
+        Event::Packet(packet) => capture_protocol_data(
+            &bot,
+            &state.lighting,
+            &state.hud,
+            &state.block_overrides,
+            &packet,
+        ),
         Event::Chat(chat) => println!("chat: {}", chat.message().to_ansi()),
         Event::Tick => {
             drain_player_actions(&bot, &state.hud, &state.action_receiver);
+            reconcile_block_overrides(&bot, &state.block_overrides);
             refresh_drowning_indicator(&bot, &state.hud);
             if state.config.mode == Mode::Render
                 && state.config.render_entities
@@ -550,11 +593,14 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                     );
                 }
                 Mode::Minimap if bot.ticks_connected().is_multiple_of(4) => {
-                    print_live_minimap(&bot, &state.lighting)?
+                    print_live_minimap(&bot, &state.lighting, &state.block_overrides)?
                 }
-                Mode::Ray if bot.ticks_connected().is_multiple_of(5) => {
-                    print_forward_hit(&bot, state.config.render.max_distance, &state.lighting)?
-                }
+                Mode::Ray if bot.ticks_connected().is_multiple_of(5) => print_forward_hit(
+                    &bot,
+                    state.config.render.max_distance,
+                    &state.lighting,
+                    &state.block_overrides,
+                )?,
                 _ => {}
             }
         }
@@ -575,6 +621,7 @@ fn capture_protocol_data(
     bot: &Client,
     store: &Arc<RwLock<LightStore>>,
     hud: &HudSnapshots,
+    block_overrides: &BlockOverrides,
     packet: &azalea::protocol::packets::game::ClientboundGamePacket,
 ) {
     use azalea::protocol::packets::game::ClientboundGamePacket;
@@ -611,6 +658,7 @@ fn capture_protocol_data(
                 .write()
                 .expect("lighting cache lock poisoned")
                 .remove_chunk(packet.pos.x, packet.pos.z);
+            remove_chunk_block_overrides(block_overrides, packet.pos.x, packet.pos.z);
         }
         ClientboundGamePacket::LightUpdate(packet) => {
             if let Some(min_y) = world_min_y(bot) {
@@ -621,6 +669,34 @@ fn capture_protocol_data(
             if let Some(min_y) = world_min_y(bot) {
                 apply_light_packet(store, packet.x, packet.z, min_y, &packet.light_data);
             }
+            // A full chunk payload supersedes any individual updates we kept
+            // while it was in flight.
+            remove_chunk_block_overrides(block_overrides, packet.x, packet.z);
+        }
+        ClientboundGamePacket::BlockUpdate(packet) => {
+            set_block_override(block_overrides, packet.pos, &packet.block_state);
+        }
+        ClientboundGamePacket::SectionBlocksUpdate(packet) => {
+            let mut overrides = block_overrides
+                .write()
+                .expect("block override lock poisoned");
+            for state in &packet.states {
+                set_block_override_locked(
+                    &mut overrides,
+                    packet.section_pos + state.pos,
+                    &state.state,
+                );
+            }
+        }
+        ClientboundGamePacket::Respawn(_) => {
+            block_overrides
+                .write()
+                .expect("block override lock poisoned")
+                .clear();
+            store
+                .write()
+                .expect("lighting cache lock poisoned")
+                .clear_lighting();
         }
         ClientboundGamePacket::SetHealth(packet) => {
             hud.write()
@@ -697,6 +773,73 @@ fn update_hud_carried_item(hud: &mut HudSnapshot, item: &azalea::inventory::Item
         item.is_present().then(|| item.kind().to_str()),
         item.count(),
     );
+}
+
+fn set_block_override(
+    overrides: &BlockOverrides,
+    position: azalea::BlockPos,
+    state: &azalea::block::BlockState,
+) {
+    set_block_override_locked(
+        &mut overrides.write().expect("block override lock poisoned"),
+        position,
+        state,
+    );
+}
+
+fn set_block_override_locked(
+    overrides: &mut HashMap<BlockPos, BlockOverride>,
+    position: azalea::BlockPos,
+    state: &azalea::block::BlockState,
+) {
+    let block = block_override_from_id(state.to_trait().id());
+    overrides.insert(BlockPos::new(position.x, position.y, position.z), block);
+}
+
+fn block_override_from_id(id: &'static str) -> BlockOverride {
+    if matches!(id, "air" | "cave_air" | "void_air") {
+        BlockOverride::Air
+    } else {
+        BlockOverride::Solid(id)
+    }
+}
+
+/// Drop a packet-side override once Azalea's streamed world has applied the
+/// exact same rendering-relevant block state. Packet callbacks run before
+/// Azalea's world-update system, so keeping it only until this confirmation
+/// provides a coherent frame without turning the sidecar into a second,
+/// permanent world cache.
+fn reconcile_block_overrides(bot: &Client, overrides: &BlockOverrides) {
+    let Ok(world) = bot.world() else {
+        return;
+    };
+    let world = world.read();
+    let mut overrides = overrides.write().expect("block override lock poisoned");
+    retain_unconfirmed_block_overrides(&mut overrides, |position| {
+        world
+            .get_block_state(azalea::BlockPos::new(position.x, position.y, position.z))
+            .map(|state| state.to_trait().id())
+    });
+}
+
+fn retain_unconfirmed_block_overrides(
+    overrides: &mut HashMap<BlockPos, BlockOverride>,
+    mut streamed_block_id: impl FnMut(BlockPos) -> Option<&'static str>,
+) {
+    overrides.retain(|position, expected| {
+        streamed_block_id(*position)
+            .map(|id| block_override_from_id(id) != *expected)
+            .unwrap_or(true)
+    });
+}
+
+fn remove_chunk_block_overrides(overrides: &BlockOverrides, chunk_x: i32, chunk_z: i32) {
+    overrides
+        .write()
+        .expect("block override lock poisoned")
+        .retain(|position, _| {
+            position.x.div_euclid(16) != chunk_x || position.z.div_euclid(16) != chunk_z
+        });
 }
 
 fn drain_player_actions(bot: &Client, hud: &HudSnapshots, receiver: &ActionReceiver) {
@@ -786,13 +929,21 @@ fn apply_light_packet(
         );
 }
 
-fn print_live_minimap(bot: &Client, lighting: &Arc<RwLock<LightStore>>) -> Result<()> {
+fn print_live_minimap(
+    bot: &Client,
+    lighting: &Arc<RwLock<LightStore>>,
+    block_overrides: &BlockOverrides,
+) -> Result<()> {
     let position = bot.position()?;
     let center = position_to_block(position);
     let world = bot.world()?;
     let world = world.read();
     let lighting = lighting.read().expect("lighting cache lock poisoned");
-    let source = AzaleaWorld::new(&world, &lighting);
+    let block_overrides = block_overrides
+        .read()
+        .expect("block override lock poisoned")
+        .clone();
+    let source = AzaleaWorld::new(&world, &lighting, &block_overrides);
     // ANSI home/clear keeps this diagnostic readable without affecting its
     // direct relationship to live chunk data.
     println!("\x1b[H\x1b[2Jminimap at {center} (Y layer {})", center.y);
@@ -804,6 +955,7 @@ fn print_forward_hit(
     bot: &Client,
     max_distance: f64,
     lighting: &Arc<RwLock<LightStore>>,
+    block_overrides: &BlockOverrides,
 ) -> Result<()> {
     let eye = bot.eye_position()?;
     let direction = bot.direction()?;
@@ -816,7 +968,11 @@ fn print_forward_hit(
     let world = bot.world()?;
     let world = world.read();
     let lighting = lighting.read().expect("lighting cache lock poisoned");
-    let source = AzaleaWorld::new(&world, &lighting);
+    let block_overrides = block_overrides
+        .read()
+        .expect("block override lock poisoned")
+        .clone();
+    let source = AzaleaWorld::new(&world, &lighting, &block_overrides);
     match raycast(&source, camera.origin, forward, max_distance) {
         RayResult::Hit(hit) => println!(
             "ray: {} at {} ({:.2} blocks, {:?} face)",
@@ -840,4 +996,59 @@ fn position_to_block(position: azalea::Vec3) -> BlockPos {
 
 fn format_position(position: azalea::Vec3) -> String {
     format!("{:.2} {:.2} {:.2}", position.x, position.y, position.z)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_override_preserves_air_and_solid_states() {
+        assert_eq!(block_override_from_id("air"), BlockOverride::Air);
+        assert_eq!(block_override_from_id("cave_air"), BlockOverride::Air);
+        assert_eq!(block_override_from_id("dirt"), BlockOverride::Solid("dirt"));
+    }
+
+    #[test]
+    fn confirmed_block_overrides_are_removed_but_unconfirmed_ones_remain() {
+        let confirmed = BlockPos::new(1, 64, 1);
+        let changed_again = BlockPos::new(2, 64, 1);
+        let unloaded = BlockPos::new(3, 64, 1);
+        let mut overrides = HashMap::from([
+            (confirmed, BlockOverride::Air),
+            (changed_again, BlockOverride::Solid("dirt")),
+            (unloaded, BlockOverride::Solid("stone")),
+        ]);
+
+        retain_unconfirmed_block_overrides(&mut overrides, |position| match position {
+            value if value == confirmed => Some("void_air"),
+            value if value == changed_again => Some("grass_block"),
+            _ => None,
+        });
+
+        assert!(!overrides.contains_key(&confirmed));
+        assert_eq!(
+            overrides.get(&changed_again),
+            Some(&BlockOverride::Solid("dirt"))
+        );
+        assert_eq!(
+            overrides.get(&unloaded),
+            Some(&BlockOverride::Solid("stone"))
+        );
+    }
+
+    #[test]
+    fn forgetting_a_chunk_removes_only_its_overrides() {
+        let overrides: BlockOverrides = Arc::new(RwLock::new(HashMap::from([
+            (BlockPos::new(0, 64, 0), BlockOverride::Air),
+            (BlockPos::new(-1, 64, -1), BlockOverride::Solid("stone")),
+            (BlockPos::new(16, 64, 0), BlockOverride::Solid("dirt")),
+        ])));
+
+        remove_chunk_block_overrides(&overrides, -1, -1);
+        let overrides = overrides.read().expect("block override lock poisoned");
+        assert!(!overrides.contains_key(&BlockPos::new(-1, 64, -1)));
+        assert!(overrides.contains_key(&BlockPos::new(0, 64, 0)));
+        assert!(overrides.contains_key(&BlockPos::new(16, 64, 0)));
+    }
 }

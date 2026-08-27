@@ -26,7 +26,9 @@ use mctui::{
 
 use crate::{
     hud::HudSnapshot,
-    live::{ActionSender, EntitySnapshots, HudSnapshots, InventoryButton, PlayerAction},
+    live::{
+        ActionSender, BlockOverrides, EntitySnapshots, HudSnapshots, InventoryButton, PlayerAction,
+    },
 };
 
 const MINIMAP_RADIUS: i32 = 7;
@@ -45,6 +47,7 @@ pub(crate) struct TerminalResources {
     pub render_entities: bool,
     pub entity_snapshots: EntitySnapshots,
     pub hud_snapshots: HudSnapshots,
+    pub block_overrides: BlockOverrides,
     pub actions: ActionSender,
 }
 
@@ -105,6 +108,11 @@ pub fn run(
             .read()
             .expect("HUD snapshot lock poisoned")
             .clone();
+        let block_overrides = resources
+            .block_overrides
+            .read()
+            .expect("block override lock poisoned")
+            .clone();
 
         // Keep one read lock for the entire frame so every ray samples a
         // coherent snapshot of chunks that Azalea has already received.
@@ -115,7 +123,7 @@ pub fn run(
                 .lighting
                 .read()
                 .expect("lighting cache lock poisoned");
-            let live_world = crate::live::AzaleaWorld::new(&world, &lighting);
+            let live_world = crate::live::AzaleaWorld::new(&world, &lighting, &block_overrides);
             let frame = Frame::render_with_entities(&live_world, camera, config, &entity_markers);
             let minimap = layout.show_minimap.then(|| {
                 navigation_minimap(
