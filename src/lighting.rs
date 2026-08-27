@@ -13,6 +13,7 @@ use crate::BlockPos;
 
 const SECTION_EDGE: i32 = 16;
 const LIGHT_SECTION_BYTES: usize = 2_048;
+const DEFAULT_SERVER_TICK_RATE: f32 = 20.0;
 
 /// The block and sky light values stored by Minecraft for one block.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -48,16 +49,25 @@ impl WorldTime {
         day_factor_from_ticks(self.total_ticks, self.partial_tick)
     }
 
-    fn advance(self, elapsed_seconds: f64) -> Self {
-        // ClockState::rate is expressed in Minecraft ticks per game tick, so
-        // a normal rate of 1.0 advances at the 20 Hz game-tick rate.
+    fn advance(self, elapsed_seconds: f64, server_tick_rate: f32, server_frozen: bool) -> Self {
+        // ClockState::rate is expressed in clock ticks per game tick. The
+        // server's game-tick rate is configured independently (for example
+        // with `/tick rate`), so both values are needed to advance a clock
+        // against wall time.
         let rate = if self.rate.is_finite() {
             self.rate.max(0.0)
         } else {
             0.0
         };
+        let server_tick_rate = if server_frozen {
+            0.0
+        } else if server_tick_rate.is_finite() {
+            server_tick_rate.max(0.0)
+        } else {
+            0.0
+        };
         let elapsed_ticks = f64::from(self.partial_tick.clamp(0.0, 1.0))
-            + elapsed_seconds.max(0.0) * 20.0 * f64::from(rate);
+            + elapsed_seconds.max(0.0) * f64::from(server_tick_rate) * f64::from(rate);
         let whole_ticks = elapsed_ticks.floor().min(u64::MAX as f64) as u64;
         Self {
             total_ticks: self.total_ticks.saturating_add(whole_ticks),
@@ -110,6 +120,21 @@ struct ClockAnchor {
     received_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ServerTickState {
+    rate: f32,
+    frozen: bool,
+}
+
+impl Default for ServerTickState {
+    fn default() -> Self {
+        Self {
+            rate: DEFAULT_SERVER_TICK_RATE,
+            frozen: false,
+        }
+    }
+}
+
 /// Light data associated with the chunks currently known to mctui.
 ///
 /// A 16×16×16 section needs exactly 2,048 bytes for each kind of light. The
@@ -118,6 +143,7 @@ struct ClockAnchor {
 pub struct LightStore {
     chunks: HashMap<ChunkKey, ChunkLight>,
     time: Option<ClockAnchor>,
+    server_ticks: ServerTickState,
 }
 
 /// Borrowed raw light data decoded from one Minecraft light packet.
@@ -134,6 +160,7 @@ impl LightStore {
     pub fn clear(&mut self) {
         self.chunks.clear();
         self.time = None;
+        self.server_ticks = ServerTickState::default();
     }
 
     pub fn remove_chunk(&mut self, chunk_x: i32, chunk_z: i32) {
@@ -147,6 +174,14 @@ impl LightStore {
         self.set_time_at(time, Instant::now());
     }
 
+    /// Update the authoritative game-tick cadence from `TickingState`.
+    ///
+    /// A world clock's own rate is relative to game ticks; this packet tells
+    /// us how many game ticks the server currently runs per wall-clock second.
+    pub fn set_server_tick_state(&mut self, rate: f32, frozen: bool) {
+        self.set_server_tick_state_at(rate, frozen, Instant::now());
+    }
+
     pub fn time(&self) -> WorldTime {
         self.time_at(Instant::now())
     }
@@ -157,6 +192,14 @@ impl LightStore {
 
     pub fn day_factor(&self) -> f32 {
         self.time().day_factor()
+    }
+
+    pub fn server_tick_rate(&self) -> f32 {
+        self.server_ticks.rate
+    }
+
+    pub fn is_server_frozen(&self) -> bool {
+        self.server_ticks.frozen
     }
 
     /// Clear streamed light while retaining the latest clock anchor. Respawns
@@ -188,11 +231,27 @@ impl LightStore {
         self.time = Some(ClockAnchor { time, received_at });
     }
 
+    fn set_server_tick_state_at(&mut self, rate: f32, frozen: bool, received_at: Instant) {
+        // First advance using the old cadence, then re-anchor at the exact
+        // instant the server reports a new cadence. That avoids a visual jump
+        // when `/tick rate`, `/tick freeze`, or `/tick unfreeze` is used.
+        if let Some(time) = self.time_at_option(received_at) {
+            self.time = Some(ClockAnchor { time, received_at });
+        }
+        self.server_ticks = ServerTickState { rate, frozen };
+    }
+
     fn time_at(&self, now: Instant) -> WorldTime {
-        self.time.map_or(WorldTime::NOON, |anchor| {
+        self.time_at_option(now).unwrap_or(WorldTime::NOON)
+    }
+
+    fn time_at_option(&self, now: Instant) -> Option<WorldTime> {
+        self.time.map(|anchor| {
             anchor.time.advance(
                 now.saturating_duration_since(anchor.received_at)
                     .as_secs_f64(),
+                self.server_ticks.rate,
+                self.server_ticks.frozen,
             )
         })
     }
@@ -490,6 +549,54 @@ mod tests {
         let advanced = store.time_at(start + std::time::Duration::from_millis(500));
         assert_eq!(advanced.total_ticks, 6_010);
         assert!((advanced.partial_tick - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn server_tick_rate_scales_the_clock_against_wall_time() {
+        let start = Instant::now();
+        let mut store = LightStore::default();
+        store.set_server_tick_state_at(200.0, false, start);
+        store.set_time_at(
+            WorldTime {
+                total_ticks: 6_000,
+                partial_tick: 0.0,
+                rate: 1.0,
+            },
+            start,
+        );
+
+        assert_eq!(
+            store
+                .time_at(start + std::time::Duration::from_millis(500))
+                .total_ticks,
+            6_100
+        );
+    }
+
+    #[test]
+    fn changing_or_freezing_the_server_tick_rate_reanchors_without_a_jump() {
+        let start = Instant::now();
+        let mut store = LightStore::default();
+        store.set_time_at(
+            WorldTime {
+                total_ticks: 6_000,
+                partial_tick: 0.0,
+                rate: 1.0,
+            },
+            start,
+        );
+        let high_rate_at = start + std::time::Duration::from_secs(1);
+        store.set_server_tick_state_at(200.0, false, high_rate_at);
+        let freeze_at = high_rate_at + std::time::Duration::from_millis(500);
+        store.set_server_tick_state_at(200.0, true, freeze_at);
+
+        assert_eq!(store.time_at(freeze_at).total_ticks, 6_120);
+        assert_eq!(
+            store
+                .time_at(freeze_at + std::time::Duration::from_secs(5))
+                .total_ticks,
+            6_120
+        );
     }
 
     #[test]

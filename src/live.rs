@@ -575,8 +575,10 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                     let light_position = position_to_block(position);
                     let lighting = state.lighting.read().expect("lighting cache lock poisoned");
                     let light = lighting.light_at(light_position);
+                    let clock = lighting.time();
                     println!(
-                        "position {}  yaw {:.1} pitch {:.1}  light {}  day {:.2} ({})",
+                        "position {}  yaw {:.1} pitch {:.1}  light {}  day {:.2}  \
+                         clock {}+{:.2} x{:.2} @ {:.1} TPS{} ({})",
                         format_position(position),
                         direction.y_rot(),
                         direction.x_rot(),
@@ -585,6 +587,15 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                             |levels| format!("block={} sky={}", levels.block, levels.sky)
                         ),
                         lighting.day_factor(),
+                        clock.total_ticks,
+                        clock.partial_tick,
+                        clock.rate,
+                        lighting.server_tick_rate(),
+                        if lighting.is_server_frozen() {
+                            " frozen"
+                        } else {
+                            ""
+                        },
                         if lighting.has_received_time() {
                             "packet clock"
                         } else {
@@ -652,6 +663,12 @@ fn capture_protocol_data(
                     rate: 1.0,
                 });
             }
+        }
+        ClientboundGamePacket::TickingState(packet) => {
+            store
+                .write()
+                .expect("lighting cache lock poisoned")
+                .set_server_tick_state(packet.tick_rate, packet.is_frozen);
         }
         ClientboundGamePacket::ForgetLevelChunk(packet) => {
             store
