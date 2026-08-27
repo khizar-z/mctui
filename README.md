@@ -22,7 +22,7 @@ and safe synchronization between the game client and rendering thread.
 - Uses packet-backed sky light, block light, and a smoothly advancing server clock
 - Keeps lighting coherent when chunks stream, blocks change, and light updates arrive separately
 - Handles water, glass, ice, and lava as translucent layers, including underwater overlays
-- Offers opt-in procedural block textures: grain, grass sides, wood bands, ore flecks, leaf noise, and animated water
+- Offers opt-in procedural block textures: grain, grass sides, wood bands, leaf noise, and animated water
 - Provides live target data, navigation minimap, health, hunger, XP, hotbar, and drowning HUDs
 - Supports movement, sprinting, swimming, block breaking, block use/placement, and hotbar selection
 - Includes a keyboard-driven, server-synchronised player inventory overlay
