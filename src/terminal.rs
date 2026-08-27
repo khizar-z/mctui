@@ -248,43 +248,39 @@ fn apply_key(
         return apply_inventory_key(actions, inventory_ui, key);
     }
 
-    let movement = match key.code {
-        KeyCode::Char('w') => Some(WalkDirection::Forward),
-        KeyCode::Char('s') => Some(WalkDirection::Backward),
-        // Azalea's lateral walk directions are inverted relative to the
-        // rendered camera's handedness, so map the familiar WASD bindings
-        // accordingly.
-        KeyCode::Char('a') => Some(WalkDirection::Right),
-        KeyCode::Char('d') => Some(WalkDirection::Left),
-        KeyCode::Char(' ') => {
-            bot.jump();
-            return Ok(true);
-        }
-        KeyCode::Char('x') => {
-            bot.walk(WalkDirection::None);
-            return Ok(true);
-        }
-        KeyCode::Char('e') => {
-            inventory_ui.open = true;
-            return Ok(true);
-        }
-        KeyCode::Char('f') => {
-            queue_targeted_action(actions, interaction_target, PlayerAction::StartMining)?;
-            return Ok(true);
-        }
-        KeyCode::Char('g') => {
-            queue_targeted_action(actions, interaction_target, PlayerAction::UseTargetedBlock)?;
-            return Ok(true);
-        }
-        KeyCode::Char(digit @ '1'..='9') => {
-            let slot = digit as u8 - b'1';
-            actions
-                .send(PlayerAction::SelectHotbarSlot(slot))
-                .map_err(|_| eyre::eyre!("client action loop stopped"))?;
-            return Ok(true);
-        }
-        KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
-        _ => None,
+    let movement = match movement_for_key(key.code) {
+        Some(movement) => Some(movement),
+        None => match key.code {
+            KeyCode::Char(' ') => {
+                bot.jump();
+                return Ok(true);
+            }
+            KeyCode::Char('x') => {
+                bot.walk(WalkDirection::None);
+                return Ok(true);
+            }
+            KeyCode::Char('e') => {
+                inventory_ui.open = true;
+                return Ok(true);
+            }
+            KeyCode::Char('f') => {
+                queue_targeted_action(actions, interaction_target, PlayerAction::StartMining)?;
+                return Ok(true);
+            }
+            KeyCode::Char('g') => {
+                queue_targeted_action(actions, interaction_target, PlayerAction::UseTargetedBlock)?;
+                return Ok(true);
+            }
+            KeyCode::Char(digit @ '1'..='9') => {
+                let slot = digit as u8 - b'1';
+                actions
+                    .send(PlayerAction::SelectHotbarSlot(slot))
+                    .map_err(|_| eyre::eyre!("client action loop stopped"))?;
+                return Ok(true);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
+            _ => None,
+        },
     };
 
     if let Some(movement) = movement {
@@ -296,22 +292,38 @@ fn apply_key(
         return Ok(true);
     }
 
+    if key.code == KeyCode::Char('c') {
+        bot.set_crouching(!bot.crouching())?;
+        return Ok(true);
+    }
+
     let current = bot.direction()?;
-    let (yaw, pitch) = match key.code {
-        // Azalea's yaw sign is the opposite of the intuitive terminal
-        // left/right direction in this camera projection.
-        KeyCode::Left => (current.y_rot() + LOOK_STEP_DEGREES, current.x_rot()),
-        KeyCode::Right => (current.y_rot() - LOOK_STEP_DEGREES, current.x_rot()),
-        KeyCode::Up => (current.y_rot(), current.x_rot() - LOOK_STEP_DEGREES),
-        KeyCode::Down => (current.y_rot(), current.x_rot() + LOOK_STEP_DEGREES),
-        KeyCode::Char('c') => {
-            bot.set_crouching(!bot.crouching())?;
-            return Ok(true);
-        }
-        _ => return Ok(true),
+    let Some((yaw, pitch)) = look_angles_after_key(current.y_rot(), current.x_rot(), key.code)
+    else {
+        return Ok(true);
     };
     bot.set_direction(yaw, pitch)?;
     Ok(true)
+}
+
+fn movement_for_key(key: KeyCode) -> Option<WalkDirection> {
+    match key {
+        KeyCode::Char('w') => Some(WalkDirection::Forward),
+        KeyCode::Char('a') => Some(WalkDirection::Left),
+        KeyCode::Char('s') => Some(WalkDirection::Backward),
+        KeyCode::Char('d') => Some(WalkDirection::Right),
+        _ => None,
+    }
+}
+
+fn look_angles_after_key(yaw: f32, pitch: f32, key: KeyCode) -> Option<(f32, f32)> {
+    match key {
+        KeyCode::Left => Some((yaw - LOOK_STEP_DEGREES, pitch)),
+        KeyCode::Right => Some((yaw + LOOK_STEP_DEGREES, pitch)),
+        KeyCode::Up => Some((yaw, pitch - LOOK_STEP_DEGREES)),
+        KeyCode::Down => Some((yaw, pitch + LOOK_STEP_DEGREES)),
+        _ => None,
+    }
 }
 
 fn queue_targeted_action(
@@ -703,5 +715,37 @@ mod tests {
         append_text_line(&mut output, "12345", 4, false);
 
         assert_eq!(output, "\x1b[0m\x1b[2K1234");
+    }
+
+    #[test]
+    fn look_arrows_follow_minecraft_yaw_direction() {
+        assert_eq!(
+            look_angles_after_key(0.0, 0.0, KeyCode::Left),
+            Some((-6.0, 0.0))
+        );
+        assert_eq!(
+            look_angles_after_key(0.0, 0.0, KeyCode::Right),
+            Some((6.0, 0.0))
+        );
+        assert_eq!(
+            look_angles_after_key(0.0, 0.0, KeyCode::Up),
+            Some((0.0, -6.0))
+        );
+        assert_eq!(
+            look_angles_after_key(0.0, 0.0, KeyCode::Down),
+            Some((0.0, 6.0))
+        );
+    }
+
+    #[test]
+    fn wasd_lateral_keys_follow_the_player_perspective() {
+        assert_eq!(
+            movement_for_key(KeyCode::Char('a')),
+            Some(WalkDirection::Left)
+        );
+        assert_eq!(
+            movement_for_key(KeyCode::Char('d')),
+            Some(WalkDirection::Right)
+        );
     }
 }

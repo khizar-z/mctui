@@ -462,11 +462,15 @@ impl Camera {
         )
         .normalized()
         .expect("a look direction is never zero");
-        let right = Vec3::new(yaw.cos(), 0.0, yaw.sin())
+        // Minecraft uses +X east, +Y up, and +Z south. In that coordinate
+        // system, the player's right vector is `forward × world_up`.
+        // Keeping this distinct from the forward formula avoids horizontally
+        // mirroring the first-person view.
+        let right = Vec3::new(-yaw.cos(), 0.0, -yaw.sin())
             .normalized()
             .expect("a horizontal look direction is never zero");
-        let up = forward
-            .cross(right)
+        let up = right
+            .cross(forward)
             .normalized()
             .expect("camera basis vectors are non-parallel");
         (forward, right, up)
@@ -1284,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_zero_yaw_faces_south() {
+    fn camera_basis_matches_minecraft_handedness() {
         let (forward, right, up) = Camera {
             origin: Vec3::ZERO,
             yaw_degrees: 0.0,
@@ -1292,8 +1296,17 @@ mod tests {
         }
         .basis();
         assert!((forward.z - 1.0).abs() < 1e-10);
-        assert!((right.x - 1.0).abs() < 1e-10);
+        assert!((right.x + 1.0).abs() < 1e-10);
         assert!((up.y - 1.0).abs() < 1e-10);
+
+        let (forward, right, _) = Camera {
+            origin: Vec3::ZERO,
+            yaw_degrees: -90.0,
+            pitch_degrees: 0.0,
+        }
+        .basis();
+        assert!((forward.x - 1.0).abs() < 1e-10);
+        assert!((right.z - 1.0).abs() < 1e-10);
     }
 
     #[test]
