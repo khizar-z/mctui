@@ -675,17 +675,17 @@ fn capture_protocol_data(
         }
         ClientboundGamePacket::BlockUpdate(packet) => {
             set_block_override(block_overrides, packet.pos, &packet.block_state);
+            invalidate_block_light(store, packet.pos);
         }
         ClientboundGamePacket::SectionBlocksUpdate(packet) => {
             let mut overrides = block_overrides
                 .write()
                 .expect("block override lock poisoned");
+            let mut lighting = store.write().expect("lighting cache lock poisoned");
             for state in &packet.states {
-                set_block_override_locked(
-                    &mut overrides,
-                    packet.section_pos + state.pos,
-                    &state.state,
-                );
+                let position = packet.section_pos + state.pos;
+                set_block_override_locked(&mut overrides, position, &state.state);
+                lighting.invalidate_light_at(BlockPos::new(position.x, position.y, position.z));
             }
         }
         ClientboundGamePacket::Respawn(_) => {
@@ -927,6 +927,13 @@ fn apply_light_packet(
                 block_updates: packet.block_updates.as_ref(),
             },
         );
+}
+
+fn invalidate_block_light(store: &Arc<RwLock<LightStore>>, position: azalea::BlockPos) {
+    store
+        .write()
+        .expect("lighting cache lock poisoned")
+        .invalidate_light_at(BlockPos::new(position.x, position.y, position.z));
 }
 
 fn print_live_minimap(

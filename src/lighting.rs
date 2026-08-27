@@ -96,6 +96,12 @@ struct ChunkLight {
     /// update did not include that section.
     empty_sky: HashSet<i32>,
     empty_block: HashSet<i32>,
+    /// A block-state update can turn a previously dark solid voxel into an
+    /// open light sample before its matching light packet arrives. Keep that
+    /// one sample unknown instead of incorrectly reusing the old solid's
+    /// value.
+    invalid_sky: HashSet<(i32, usize)>,
+    invalid_block: HashSet<(i32, usize)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,6 +165,25 @@ impl LightStore {
         self.chunks.clear();
     }
 
+    /// Mark the light at a block position stale after a server block update.
+    ///
+    /// Block and lighting packets are independent. In particular, a block
+    /// that just became air must not inherit the old solid block's zero sky
+    /// light while waiting for the matching `LightUpdate` packet. The next
+    /// update for the affected section clears this marker.
+    pub fn invalidate_light_at(&mut self, position: BlockPos) {
+        let key = ChunkKey {
+            x: position.x.div_euclid(SECTION_EDGE),
+            z: position.z.div_euclid(SECTION_EDGE),
+        };
+        let Some(chunk) = self.chunks.get_mut(&key) else {
+            return;
+        };
+        let (section_y, index) = light_section_and_index(position);
+        chunk.invalid_sky.insert((section_y, index));
+        chunk.invalid_block.insert((section_y, index));
+    }
+
     fn set_time_at(&mut self, time: WorldTime, received_at: Instant) {
         self.time = Some(ClockAnchor { time, received_at });
     }
@@ -196,18 +221,21 @@ impl LightStore {
         clear_sections(
             &mut chunk.sky,
             &mut chunk.empty_sky,
+            &mut chunk.invalid_sky,
             data.empty_sky,
             min_section,
         );
         clear_sections(
             &mut chunk.block,
             &mut chunk.empty_block,
+            &mut chunk.invalid_block,
             data.empty_block,
             min_section,
         );
         insert_sections(
             &mut chunk.sky,
             &mut chunk.empty_sky,
+            &mut chunk.invalid_sky,
             data.sky_present,
             data.sky_updates,
             min_section,
@@ -215,6 +243,7 @@ impl LightStore {
         insert_sections(
             &mut chunk.block,
             &mut chunk.empty_block,
+            &mut chunk.invalid_block,
             data.block_present,
             data.block_updates,
             min_section,
@@ -229,19 +258,21 @@ impl LightStore {
             z: position.z.div_euclid(SECTION_EDGE),
         };
         let chunk = self.chunks.get(&key)?;
-        let section_y = position.y.div_euclid(SECTION_EDGE);
-        let local_x = position.x.rem_euclid(SECTION_EDGE) as usize;
-        let local_y = position.y.rem_euclid(SECTION_EDGE) as usize;
-        let local_z = position.z.rem_euclid(SECTION_EDGE) as usize;
-        let index = local_x | (local_z << 4) | (local_y << 8);
+        let (section_y, index) = light_section_and_index(position);
 
         // Sparse light packets only describe changed sections. An omitted sky
         // section is unknown, not black: returning None lets the live adapter
         // preserve its explicit bright startup fallback until the server gives
         // us data for this exact section. Known-empty sections still render
         // with zero sky light.
-        let sky = light_value(&chunk.sky, &chunk.empty_sky, section_y, index)?;
-        let block = light_value(&chunk.block, &chunk.empty_block, section_y, index).unwrap_or(0);
+        let sky = (!chunk.invalid_sky.contains(&(section_y, index)))
+            .then(|| light_value(&chunk.sky, &chunk.empty_sky, section_y, index))
+            .flatten()?;
+        let block = if chunk.invalid_block.contains(&(section_y, index)) {
+            0
+        } else {
+            light_value(&chunk.block, &chunk.empty_block, section_y, index).unwrap_or(0)
+        };
         Some(LightLevels::new(block, sky))
     }
 }
@@ -249,6 +280,7 @@ impl LightStore {
 fn clear_sections(
     sections: &mut HashMap<i32, Box<[u8]>>,
     empty_sections: &mut HashSet<i32>,
+    invalid_samples: &mut HashSet<(i32, usize)>,
     masks: &[usize],
     min_section: i32,
 ) {
@@ -256,12 +288,14 @@ fn clear_sections(
         let section = min_section + mask_index as i32;
         sections.remove(&section);
         empty_sections.insert(section);
+        invalid_samples.retain(|(sample_section, _)| *sample_section != section);
     }
 }
 
 fn insert_sections(
     sections: &mut HashMap<i32, Box<[u8]>>,
     empty_sections: &mut HashSet<i32>,
+    invalid_samples: &mut HashSet<(i32, usize)>,
     masks: &[usize],
     updates: &[Box<[u8]>],
     min_section: i32,
@@ -273,8 +307,17 @@ fn insert_sections(
             let section = min_section + mask_index as i32;
             sections.insert(section, update.clone());
             empty_sections.remove(&section);
+            invalid_samples.retain(|(sample_section, _)| *sample_section != section);
         }
     }
+}
+
+fn light_section_and_index(position: BlockPos) -> (i32, usize) {
+    let section_y = position.y.div_euclid(SECTION_EDGE);
+    let local_x = position.x.rem_euclid(SECTION_EDGE) as usize;
+    let local_y = position.y.rem_euclid(SECTION_EDGE) as usize;
+    let local_z = position.z.rem_euclid(SECTION_EDGE) as usize;
+    (section_y, local_x | (local_z << 4) | (local_y << 8))
 }
 
 fn light_value(
@@ -383,6 +426,45 @@ mod tests {
 
         // Section 1 is known, but section 2 was not declared empty or sent.
         assert_eq!(store.light_at(BlockPos::new(0, 16, 0)), None);
+    }
+
+    #[test]
+    fn block_change_invalidates_its_old_light_until_a_light_packet_replaces_it() {
+        let position = BlockPos::new(2, 3, 4);
+        let index = 2 | (4 << 4) | (3 << 8);
+        let mut store = LightStore::default();
+        store.apply_packet(
+            0,
+            0,
+            0,
+            PacketLightData {
+                sky_present: &[1],
+                block_present: &[1],
+                empty_sky: &[],
+                empty_block: &[],
+                sky_updates: &[light_section(index, 0)],
+                block_updates: &[light_section(index, 0)],
+            },
+        );
+        assert_eq!(store.light_at(position), Some(LightLevels::new(0, 0)));
+
+        store.invalidate_light_at(position);
+        assert_eq!(store.light_at(position), None);
+
+        store.apply_packet(
+            0,
+            0,
+            0,
+            PacketLightData {
+                sky_present: &[1],
+                block_present: &[1],
+                empty_sky: &[],
+                empty_block: &[],
+                sky_updates: &[light_section(index, 15)],
+                block_updates: &[light_section(index, 0)],
+            },
+        );
+        assert_eq!(store.light_at(position), Some(LightLevels::new(0, 15)));
     }
 
     #[test]
