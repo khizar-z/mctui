@@ -152,7 +152,8 @@ pub fn run(
             &frame,
             DrawView {
                 status: &format!(
-                "mctui  {fps:>4.1} fps  {render_ms:>5.1} ms  pos {:.1} {:.1} {:.1}  yaw {:.1} pitch {:.1}",
+                "mctui{}  {fps:>4.1} fps  {render_ms:>5.1} ms  pos {:.1} {:.1} {:.1}  yaw {:.1} pitch {:.1}",
+                if config.procedural_textures { " +textures" } else { "" },
                 position.x,
                 position.y,
                 position.z,

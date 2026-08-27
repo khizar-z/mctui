@@ -4,7 +4,7 @@
 //! ray traversal independent of Azalea makes the important correctness logic
 //! cheap to test and lets the live adapter remain a very small boundary.
 
-use std::fmt;
+use std::{fmt, sync::OnceLock, time::Instant};
 
 pub mod lighting;
 
@@ -481,6 +481,9 @@ pub struct RenderConfig {
     pub height: usize,
     pub horizontal_fov_degrees: f32,
     pub max_distance: f64,
+    /// Enable deterministic procedural material detail. This is kept opt-in
+    /// while the palette is tuned for terminal readability.
+    pub procedural_textures: bool,
 }
 
 impl Default for RenderConfig {
@@ -490,6 +493,7 @@ impl Default for RenderConfig {
             height: 24,
             horizontal_fov_degrees: 75.0,
             max_distance: 48.0,
+            procedural_textures: false,
         }
     }
 }
@@ -543,6 +547,10 @@ impl Frame {
         let (forward, right, up) = camera.basis();
         let aspect = width as f64 / sample_height as f64;
         let half_fov = (config.horizontal_fov_degrees.to_radians() as f64 / 2.0).tan();
+        let texture_phase = config
+            .procedural_textures
+            .then(texture_animation_phase)
+            .unwrap_or(0);
 
         for y in 0..sample_height {
             let screen_y = 1.0 - 2.0 * (y as f64 + 0.5) / sample_height as f64;
@@ -557,6 +565,8 @@ impl Frame {
                     camera.origin,
                     direction,
                     config.max_distance,
+                    config.procedural_textures,
+                    texture_phase,
                 ));
             }
         }
@@ -673,11 +683,22 @@ fn sample_color(
     origin: Vec3,
     direction: Vec3,
     max_distance: f64,
+    procedural_textures: bool,
+    texture_phase: u32,
 ) -> Rgb {
     let sky = sky_color(direction.y, source.day_factor());
     let scene = trace_scene(source, origin, direction, max_distance);
     let mut color = match scene.terminal {
-        RayTerminal::Opaque(hit) => shade_hit(source, hit, sky, max_distance),
+        RayTerminal::Opaque(hit) => shade_hit(
+            source,
+            hit,
+            sky,
+            max_distance,
+            origin,
+            direction,
+            procedural_textures,
+            texture_phase,
+        ),
         RayTerminal::Miss | RayTerminal::LayerLimit => sky,
         RayTerminal::Unloaded { distance } => {
             let fog = (distance / max_distance.max(0.001)) as f32;
@@ -690,7 +711,16 @@ fn sample_color(
     for hit in scene.layers[..scene.layer_count].iter().rev().flatten() {
         let appearance = block_appearance(hit.block.id);
         color = color.mix(
-            shade_hit(source, *hit, sky, max_distance),
+            shade_hit(
+                source,
+                *hit,
+                sky,
+                max_distance,
+                origin,
+                direction,
+                procedural_textures,
+                texture_phase,
+            ),
             appearance.opacity,
         );
     }
@@ -803,7 +833,17 @@ fn trace_voxel(
     }
 }
 
-fn shade_hit(source: &impl BlockSource, hit: RayHit, sky: Rgb, max_distance: f64) -> Rgb {
+#[allow(clippy::too_many_arguments)]
+fn shade_hit(
+    source: &impl BlockSource,
+    hit: RayHit,
+    sky: Rgb,
+    max_distance: f64,
+    origin: Vec3,
+    direction: Vec3,
+    procedural_textures: bool,
+    texture_phase: u32,
+) -> Rgb {
     let face_light = hit.entered_face.map(Face::lighting).unwrap_or(1.0);
     let light_position = hit.entered_face.map_or(hit.position, |face| {
         face.light_sample_position(hit.position)
@@ -818,10 +858,218 @@ fn shade_hit(source: &impl BlockSource, hit: RayHit, sky: Rgb, max_distance: f64
         .clamp(0.0, 1.0)
         .powf(1.65)
         * 0.28;
-    block_appearance(hit.block.id)
-        .color
-        .scale(face_light * brightness)
-        .mix(sky, fog)
+    let material = if procedural_textures {
+        procedural_block_color(hit, origin, direction, texture_phase)
+    } else {
+        block_appearance(hit.block.id).color
+    };
+    material.scale(face_light * brightness).mix(sky, fog)
+}
+
+/// Timebase shared by one rendered frame for the animated water pattern.
+/// Static block detail is entirely determined by its identifier, world
+/// position, entered face, and local surface texel.
+fn texture_animation_phase() -> u32 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    (START.get_or_init(Instant::now).elapsed().as_millis() / 120) as u32
+}
+
+fn procedural_block_color(hit: RayHit, origin: Vec3, direction: Vec3, phase: u32) -> Rgb {
+    let surface = origin + direction * hit.distance;
+    let face = hit.entered_face.unwrap_or(Face::Top);
+    let (u, v) = surface_texel(face, surface);
+    textured_material_color(hit.block.id, hit.position, face, u, v, phase)
+}
+
+fn surface_texel(face: Face, surface: Vec3) -> (i32, i32) {
+    let (u, v) = match face {
+        Face::Top | Face::Bottom => (surface.x, surface.z),
+        Face::North | Face::South => (surface.x, surface.y),
+        Face::West | Face::East => (surface.z, surface.y),
+    };
+    (texture_coordinate(u), texture_coordinate(v))
+}
+
+fn texture_coordinate(value: f64) -> i32 {
+    (value.rem_euclid(1.0) * 16.0).floor().clamp(0.0, 15.0) as i32
+}
+
+fn textured_material_color(
+    id: &str,
+    position: BlockPos,
+    face: Face,
+    u: i32,
+    v: i32,
+    phase: u32,
+) -> Rgb {
+    let base = block_appearance(id).color;
+    let static_noise = texture_hash(id, position, face, u, v, 0);
+
+    match id {
+        "water" | "bubble_column" => animated_water_color(base, position, face, u, v, phase),
+        "grass_block" => grass_block_color(position, face, u, v, static_noise),
+        "dirt" | "coarse_dirt" | "rooted_dirt" | "farmland" | "mud" => {
+            dirt_color(base, static_noise)
+        }
+        "stone" | "cobblestone" | "andesite" | "diorite" | "granite" | "deepslate"
+        | "cobbled_deepslate" | "tuff" => stone_color(base, static_noise),
+        _ if id.contains("ore") => ore_color(id, base, position, face, u, v, static_noise),
+        _ if id.contains("leaves") || id.contains("azalea") => leaf_color(base, static_noise),
+        _ if id.contains("log") || id.contains("wood") || id.contains("stem") => {
+            wood_color(base, position, face, u, v, static_noise)
+        }
+        _ if id.contains("sand") => sand_color(base, static_noise),
+        _ => subtle_texture(base, static_noise),
+    }
+}
+
+fn dirt_color(base: Rgb, noise: u32) -> Rgb {
+    match noise % 17 {
+        0 => base.scale(0.68),
+        1..=3 => base.scale(0.82),
+        4 => base.mix(Rgb::new(171, 126, 76), 0.24),
+        _ => base,
+    }
+}
+
+fn stone_color(base: Rgb, noise: u32) -> Rgb {
+    match noise % 23 {
+        0 => base.scale(0.58),
+        1..=3 => base.scale(0.76),
+        4..=5 => base.mix(Rgb::new(190, 190, 190), 0.18),
+        _ => base,
+    }
+}
+
+fn sand_color(base: Rgb, noise: u32) -> Rgb {
+    match noise % 19 {
+        0..=1 => base.scale(0.82),
+        2 => base.mix(Rgb::new(248, 232, 173), 0.24),
+        _ => base,
+    }
+}
+
+fn leaf_color(base: Rgb, noise: u32) -> Rgb {
+    match noise % 13 {
+        0..=1 => base.scale(0.62),
+        2..=3 => base.mix(Rgb::new(116, 178, 77), 0.26),
+        _ => base,
+    }
+}
+
+fn grass_block_color(position: BlockPos, face: Face, u: i32, v: i32, noise: u32) -> Rgb {
+    const GRASS: Rgb = Rgb::new(94, 159, 53);
+
+    if face == Face::Top {
+        return match noise % 13 {
+            0 => GRASS.scale(0.66),
+            1..=2 => GRASS.mix(Rgb::new(138, 191, 77), 0.28),
+            _ => GRASS,
+        };
+    }
+    if face != Face::Bottom && v >= 13 {
+        // The upper three texels retain grass on the vertical faces; lower
+        // texels expose patterned dirt, like a Minecraft grass block side.
+        return match texture_hash("grass_turf", position, face, u, v, 0) % 11 {
+            0 => GRASS.scale(0.68),
+            1 => GRASS.mix(Rgb::new(139, 189, 79), 0.22),
+            _ => GRASS,
+        };
+    }
+    dirt_color(Rgb::new(126, 92, 57), noise)
+}
+
+fn wood_color(base: Rgb, position: BlockPos, face: Face, u: i32, v: i32, noise: u32) -> Rgb {
+    if matches!(face, Face::Top | Face::Bottom) {
+        let from_center = (u - 7).unsigned_abs().max((v - 7).unsigned_abs());
+        let ring = (from_center / 3) % 2;
+        return if ring == 0 {
+            base.mix(Rgb::new(151, 112, 67), 0.20)
+        } else {
+            base.scale(0.70)
+        };
+    }
+
+    let band = (v + position.y.rem_euclid(6)) / 3;
+    match (band + (noise % 3) as i32) % 5 {
+        0 => base.scale(0.62),
+        1 => base.mix(Rgb::new(147, 108, 61), 0.22),
+        _ => base,
+    }
+}
+
+fn ore_color(
+    id: &str,
+    base: Rgb,
+    position: BlockPos,
+    face: Face,
+    u: i32,
+    v: i32,
+    noise: u32,
+) -> Rgb {
+    let fleck = if id.contains("diamond") {
+        Rgb::new(79, 213, 222)
+    } else if id.contains("emerald") {
+        Rgb::new(78, 205, 111)
+    } else if id.contains("redstone") {
+        Rgb::new(204, 51, 42)
+    } else if id.contains("lapis") {
+        Rgb::new(51, 91, 193)
+    } else if id.contains("gold") {
+        Rgb::new(233, 185, 55)
+    } else if id.contains("copper") {
+        Rgb::new(201, 111, 66)
+    } else if id.contains("coal") {
+        Rgb::new(44, 46, 50)
+    } else if id.contains("quartz") {
+        Rgb::new(229, 214, 203)
+    } else {
+        Rgb::new(198, 181, 144)
+    };
+    let neighbour = texture_hash(id, position, face, u + 1, v, 0);
+    if noise.is_multiple_of(11) || neighbour.is_multiple_of(29) {
+        base.mix(fleck, 0.86)
+    } else {
+        stone_color(base, noise)
+    }
+}
+
+fn animated_water_color(
+    base: Rgb,
+    position: BlockPos,
+    face: Face,
+    u: i32,
+    v: i32,
+    phase: u32,
+) -> Rgb {
+    let flow = u * 3 + v * 2 + position.x * 5 - position.z * 3 + phase as i32;
+    match flow.rem_euclid(9) {
+        0..=1 => base.mix(Rgb::new(111, 181, 227), 0.36),
+        7..=8 => base.scale(0.72),
+        _ if matches!(face, Face::Top | Face::Bottom) => base.mix(Rgb::new(69, 132, 207), 0.10),
+        _ => base,
+    }
+}
+
+fn subtle_texture(base: Rgb, noise: u32) -> Rgb {
+    match noise % 31 {
+        0 => base.scale(0.78),
+        1 => base.mix(Rgb::new(230, 230, 230), 0.12),
+        _ => base,
+    }
+}
+
+fn texture_hash(id: &str, position: BlockPos, face: Face, u: i32, v: i32, phase: u32) -> u32 {
+    let mut hash = 0x9e37_79b9_u32;
+    for value in [position.x, position.y, position.z, u, v, face as i32] {
+        hash ^= value as u32;
+        hash = hash.wrapping_mul(0x85eb_ca6b).rotate_left(13);
+    }
+    for byte in id.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0xc2b2_ae35).rotate_left(11);
+    }
+    hash ^ phase.wrapping_mul(0x27d4_eb2d)
 }
 
 fn sky_color(ray_y: f64, day_factor: f32) -> Rgb {
@@ -1080,6 +1328,7 @@ mod tests {
             height: 6,
             horizontal_fov_degrees: 75.0,
             max_distance: 12.0,
+            procedural_textures: false,
         };
         let marker = EntityMarker {
             position: Vec3::new(0.5, 0.0, 5.5),
@@ -1185,11 +1434,73 @@ mod tests {
             block: Block { id: "stone" },
             entered_face: Some(Face::West),
         };
-        let outside_lit = shade_hit(&world, hit, Rgb::new(100, 180, 230), 10.0);
+        let outside_lit = shade_hit(
+            &world,
+            hit,
+            Rgb::new(100, 180, 230),
+            10.0,
+            Vec3::new(0.0, 0.5, 0.5),
+            Vec3::new(1.0, 0.0, 0.0),
+            false,
+            0,
+        );
 
         world.lights.clear();
-        let unlit = shade_hit(&world, hit, Rgb::new(100, 180, 230), 10.0);
+        let unlit = shade_hit(
+            &world,
+            hit,
+            Rgb::new(100, 180, 230),
+            10.0,
+            Vec3::new(0.0, 0.5, 0.5),
+            Vec3::new(1.0, 0.0, 0.0),
+            false,
+            0,
+        );
 
         assert!(outside_lit.r > unlit.r * 5);
+    }
+
+    #[test]
+    fn procedural_textures_are_disabled_by_default() {
+        assert!(!RenderConfig::default().procedural_textures);
+    }
+
+    #[test]
+    fn grass_texture_distinguishes_top_from_dirt_side() {
+        let position = BlockPos::new(4, 70, -2);
+        let top = textured_material_color("grass_block", position, Face::Top, 5, 5, 0);
+        let side = textured_material_color("grass_block", position, Face::North, 5, 4, 0);
+
+        assert!(top.g > top.r);
+        assert!(side.r > side.g);
+    }
+
+    #[test]
+    fn ore_flecks_are_colored_and_deterministic() {
+        let position = BlockPos::new(-8, 21, 14);
+        let pattern: Vec<_> = (0..16)
+            .flat_map(|u| (0..16).map(move |v| (u, v)))
+            .map(|(u, v)| textured_material_color("diamond_ore", position, Face::North, u, v, 0))
+            .collect();
+
+        assert!(pattern.iter().any(|color| color.g > 180 && color.b > 180));
+        assert_eq!(
+            pattern,
+            (0..16)
+                .flat_map(|u| (0..16).map(move |v| (u, v)))
+                .map(|(u, v)| {
+                    textured_material_color("diamond_ore", position, Face::North, u, v, 0)
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn water_texture_changes_with_the_animation_phase() {
+        let position = BlockPos::new(0, 63, 0);
+        let first = textured_material_color("water", position, Face::Top, 0, 0, 0);
+        let later = textured_material_color("water", position, Face::Top, 0, 0, 3);
+
+        assert_ne!(first, later);
     }
 }

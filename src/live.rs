@@ -142,6 +142,7 @@ impl LiveConfig {
                     )?
                 }
                 "--entities" => config.render_entities = true,
+                "--textures" => config.render.procedural_textures = true,
                 "--online" => config.online_account = true,
                 "--allow-public-server" => config.allow_public_server = true,
                 "--help" | "-h" => {
@@ -218,6 +219,7 @@ Usage: mctui [options]\n\n\
   --fov DEGREES           Horizontal FOV (default: 75)\n\
   --view-distance CHUNKS  Server chunk request distance (default: 8)\n\
   --entities              Enable experimental nearby-entity markers\n\
+  --textures              Enable experimental procedural block textures\n\
   --online                Use Microsoft authentication instead of offline mode\n\
   --allow-public-server   Required before any non-local connection\n\n\
 Modes: monitor proves bot/position events; minimap proves block access; ray\n\

@@ -22,6 +22,7 @@ and safe synchronization between the game client and rendering thread.
 - Uses packet-backed sky light, block light, and a smoothly advancing server clock
 - Keeps lighting coherent when chunks stream, blocks change, and light updates arrive separately
 - Handles water, glass, ice, and lava as translucent layers, including underwater overlays
+- Offers opt-in procedural block textures: grain, grass sides, wood bands, ore flecks, leaf noise, and animated water
 - Provides live target data, navigation minimap, health, hunger, XP, hotbar, and drowning HUDs
 - Supports movement, sprinting, swimming, block breaking, block use/placement, and hotbar selection
 - Includes a keyboard-driven, server-synchronised player inventory overlay
@@ -59,6 +60,16 @@ cargo run --release -- --mode render \
   --width 120 --height 36 --fps 10 \
   --view-distance 12 --distance 80
 ```
+
+To try the experimental procedural material pass, add `--textures`:
+
+```sh
+cargo run --release -- --mode render --textures
+```
+
+It uses deterministic, world-anchored surface patterns rather than Minecraft
+asset files or a resource pack. Without the flag, mctui keeps its original
+compact flat-colour palette.
 
 `--width` and `--height` control the rendered viewport. The minimap occupies
 19 additional terminal columns, so the example above is most comfortable in a
@@ -120,6 +131,7 @@ mctui [options]
 | `--fov <DEGREES>` | `75` | Horizontal field of view |
 | `--view-distance <CHUNKS>` | `8` | Requested server chunk-view distance |
 | `--entities` | off | Enable experimental nearby-entity markers |
+| `--textures` | off | Enable experimental procedural block textures |
 | `--online` | off | Use Microsoft authentication instead of offline mode |
 | `--allow-public-server` | off | Permit a non-loopback server address |
 
@@ -152,7 +164,9 @@ DDA. A ray can hit an opaque block, collect a bounded number of translucent
 layers, reach open sky, or enter an unloaded region. The last case is rendered
 as unknown terrain rather than fabricated sky. Face orientation, light,
 time-of-day, distance fog, and a compact material palette produce the final
-pixel colour.
+pixel colour. With `--textures`, the final material colour receives a
+deterministic face-local detail pass: stone grain, grass top and side layers,
+wood rings and bands, ore flecks, leaf noise, and a time-animated water ripple.
 
 ### Terminal output
 
