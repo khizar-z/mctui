@@ -26,7 +26,7 @@ use mctui::{
 
 use crate::{
     hud::HudSnapshot,
-    live::{EntitySnapshots, HudSnapshots},
+    live::{ActionSender, EntitySnapshots, HudSnapshots, InventoryButton, PlayerAction},
 };
 
 const MINIMAP_RADIUS: i32 = 7;
@@ -38,16 +38,22 @@ const HEADER_ROWS: usize = 3;
 const HUD_ROWS: usize = 2;
 const CHROME_ROWS: usize = HEADER_ROWS + HUD_ROWS;
 const LOOK_STEP_DEGREES: f32 = 6.0;
+const INTERACTION_REACH: f64 = 5.0;
+
+pub(crate) struct TerminalResources {
+    pub lighting: Arc<RwLock<LightStore>>,
+    pub render_entities: bool,
+    pub entity_snapshots: EntitySnapshots,
+    pub hud_snapshots: HudSnapshots,
+    pub actions: ActionSender,
+}
 
 /// Run the interactive renderer until the user presses `q` or Escape.
 pub fn run(
     bot: Client,
     mut config: RenderConfig,
     target_fps: u16,
-    lighting: Arc<RwLock<LightStore>>,
-    render_entities: bool,
-    entity_snapshots: EntitySnapshots,
-    hud_snapshots: HudSnapshots,
+    resources: TerminalResources,
 ) -> Result<()> {
     let mut session = TerminalSession::enter()?;
     let layout = session.layout_for(config);
@@ -58,10 +64,17 @@ pub fn run(
     let mut frames = 0_u32;
     let mut fps = 0.0_f32;
     let mut fps_window = Instant::now();
+    let mut inventory_ui = InventoryUi::default();
+    let mut interaction_target = None;
 
     loop {
         let frame_started = Instant::now();
-        if !read_input(&bot)? {
+        if !read_input(
+            &bot,
+            &resources.actions,
+            &mut inventory_ui,
+            interaction_target,
+        )? {
             bot.exit();
             break;
         }
@@ -78,25 +91,30 @@ pub fn run(
             yaw_degrees: direction.y_rot(),
             pitch_degrees: direction.x_rot(),
         };
-        let entity_markers = if render_entities {
-            entity_snapshots
+        let entity_markers = if resources.render_entities {
+            resources
+                .entity_snapshots
                 .read()
                 .expect("entity snapshot lock poisoned")
                 .clone()
         } else {
             Vec::new()
         };
-        let hud = hud_snapshots
+        let hud = resources
+            .hud_snapshots
             .read()
             .expect("HUD snapshot lock poisoned")
             .clone();
 
         // Keep one read lock for the entire frame so every ray samples a
         // coherent snapshot of chunks that Azalea has already received.
-        let (mut frame, minimap, target) = {
+        let (mut frame, minimap, target, next_interaction_target) = {
             let world = bot.world()?;
             let world = world.read();
-            let lighting = lighting.read().expect("lighting cache lock poisoned");
+            let lighting = resources
+                .lighting
+                .read()
+                .expect("lighting cache lock poisoned");
             let live_world = crate::live::AzaleaWorld::new(&world, &lighting);
             let frame = Frame::render_with_entities(&live_world, camera, config, &entity_markers);
             let minimap = layout.show_minimap.then(|| {
@@ -107,9 +125,11 @@ pub fn run(
                     MINIMAP_RADIUS,
                 )
             });
-            let target = target_readout(&live_world, camera, config.max_distance);
-            (frame, minimap, target)
+            let (target, interaction_target) =
+                target_readout(&live_world, camera, config.max_distance);
+            (frame, minimap, target, interaction_target)
         };
+        interaction_target = next_interaction_target;
         frame.draw_center_crosshair();
 
         frames += 1;
@@ -133,6 +153,7 @@ pub fn run(
             &target,
             &hud,
             minimap.as_deref(),
+            inventory_ui.open.then_some(&inventory_ui),
         )?;
 
         let remaining = frame_period.saturating_sub(last_frame_at.elapsed());
@@ -145,7 +166,11 @@ pub fn run(
     Ok(())
 }
 
-fn target_readout(source: &impl BlockSource, camera: Camera, max_distance: f64) -> String {
+fn target_readout(
+    source: &impl BlockSource,
+    camera: Camera,
+    max_distance: f64,
+) -> (String, Option<mctui::BlockPos>) {
     let (forward, _, _) = camera.basis();
     match raycast(source, camera.origin, forward, max_distance) {
         RayResult::Hit(hit) => {
@@ -153,19 +178,31 @@ fn target_readout(source: &impl BlockSource, camera: Camera, max_distance: f64) 
             let face = hit
                 .entered_face
                 .map_or_else(|| "inside".to_owned(), |face| format!("{face:?}"));
-            format!(
-                "target: {} @ {}  {:.1}m  {face}  light {}/{}",
-                hit.block.id, hit.position, hit.distance, light.block, light.sky
+            (
+                format!(
+                    "target: {} @ {}  {:.1}m  {face}  light {}/{}",
+                    hit.block.id, hit.position, hit.distance, light.block, light.sky
+                ),
+                (hit.distance <= INTERACTION_REACH).then_some(hit.position),
             )
         }
-        RayResult::Miss => format!("target: sky (no block within {max_distance:.0}m)"),
-        RayResult::Unloaded { position, distance } => {
-            format!("target: unloaded at {position} after {distance:.1}m")
-        }
+        RayResult::Miss => (
+            format!("target: sky (no block within {max_distance:.0}m)"),
+            None,
+        ),
+        RayResult::Unloaded { position, distance } => (
+            format!("target: unloaded at {position} after {distance:.1}m"),
+            None,
+        ),
     }
 }
 
-fn read_input(bot: &Client) -> Result<bool> {
+fn read_input(
+    bot: &Client,
+    actions: &ActionSender,
+    inventory_ui: &mut InventoryUi,
+    interaction_target: Option<mctui::BlockPos>,
+) -> Result<bool> {
     while event::poll(Duration::ZERO)? {
         let Event::Key(key) = event::read()? else {
             continue;
@@ -173,7 +210,7 @@ fn read_input(bot: &Client) -> Result<bool> {
         if key.kind == KeyEventKind::Release {
             // Most terminal emulators do not report key releases. If one does,
             // honour it by stopping the ongoing walk command.
-            if matches!(key.code, KeyCode::Char('w' | 'a' | 's' | 'd')) {
+            if !inventory_ui.open && matches!(key.code, KeyCode::Char('w' | 'a' | 's' | 'd')) {
                 bot.walk(WalkDirection::None);
             }
             continue;
@@ -181,14 +218,24 @@ fn read_input(bot: &Client) -> Result<bool> {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             continue;
         }
-        if !apply_key(bot, key)? {
+        if !apply_key(bot, actions, inventory_ui, interaction_target, key)? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn apply_key(bot: &Client, key: KeyEvent) -> Result<bool> {
+fn apply_key(
+    bot: &Client,
+    actions: &ActionSender,
+    inventory_ui: &mut InventoryUi,
+    interaction_target: Option<mctui::BlockPos>,
+    key: KeyEvent,
+) -> Result<bool> {
+    if inventory_ui.open {
+        return apply_inventory_key(actions, inventory_ui, key);
+    }
+
     let movement = match key.code {
         KeyCode::Char('w') => Some(WalkDirection::Forward),
         KeyCode::Char('s') => Some(WalkDirection::Backward),
@@ -203,6 +250,25 @@ fn apply_key(bot: &Client, key: KeyEvent) -> Result<bool> {
         }
         KeyCode::Char('x') => {
             bot.walk(WalkDirection::None);
+            return Ok(true);
+        }
+        KeyCode::Char('e') => {
+            inventory_ui.open = true;
+            return Ok(true);
+        }
+        KeyCode::Char('f') => {
+            queue_targeted_action(actions, interaction_target, PlayerAction::StartMining)?;
+            return Ok(true);
+        }
+        KeyCode::Char('g') => {
+            queue_targeted_action(actions, interaction_target, PlayerAction::UseTargetedBlock)?;
+            return Ok(true);
+        }
+        KeyCode::Char(digit @ '1'..='9') => {
+            let slot = digit as u8 - b'1';
+            actions
+                .send(PlayerAction::SelectHotbarSlot(slot))
+                .map_err(|_| eyre::eyre!("client action loop stopped"))?;
             return Ok(true);
         }
         KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
@@ -233,6 +299,109 @@ fn apply_key(bot: &Client, key: KeyEvent) -> Result<bool> {
         _ => return Ok(true),
     };
     bot.set_direction(yaw, pitch)?;
+    Ok(true)
+}
+
+fn queue_targeted_action(
+    actions: &ActionSender,
+    target: Option<mctui::BlockPos>,
+    action: impl FnOnce(mctui::BlockPos) -> PlayerAction,
+) -> Result<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    actions
+        .send(action(target))
+        .map_err(|_| eyre::eyre!("client action loop stopped"))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InventoryUi {
+    open: bool,
+    row: usize,
+    column: usize,
+    special_slot: Option<usize>,
+}
+
+impl InventoryUi {
+    const ROWS: usize = 4;
+    const COLUMNS: usize = 9;
+    const SPECIAL_SLOTS: [usize; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 45];
+
+    fn selected_slot(self) -> usize {
+        self.special_slot
+            .unwrap_or(9 + self.row * Self::COLUMNS + self.column)
+    }
+
+    fn move_by(&mut self, row_delta: isize, column_delta: isize) {
+        self.special_slot = None;
+        self.row = (self.row as isize + row_delta).rem_euclid(Self::ROWS as isize) as usize;
+        self.column =
+            (self.column as isize + column_delta).rem_euclid(Self::COLUMNS as isize) as usize;
+    }
+
+    fn cycle_special_slot(&mut self, direction: isize) {
+        let index = self
+            .special_slot
+            .and_then(|slot| {
+                Self::SPECIAL_SLOTS
+                    .iter()
+                    .position(|candidate| *candidate == slot)
+            })
+            .map_or_else(
+                || {
+                    if direction.is_negative() {
+                        Self::SPECIAL_SLOTS.len() - 1
+                    } else {
+                        0
+                    }
+                },
+                |index| {
+                    (index as isize + direction).rem_euclid(Self::SPECIAL_SLOTS.len() as isize)
+                        as usize
+                },
+            );
+        self.special_slot = Some(Self::SPECIAL_SLOTS[index]);
+    }
+}
+
+fn apply_inventory_key(
+    actions: &ActionSender,
+    inventory_ui: &mut InventoryUi,
+    key: KeyEvent,
+) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('e') => inventory_ui.open = false,
+        KeyCode::Left => inventory_ui.move_by(0, -1),
+        KeyCode::Right => inventory_ui.move_by(0, 1),
+        KeyCode::Up => inventory_ui.move_by(-1, 0),
+        KeyCode::Down => inventory_ui.move_by(1, 0),
+        KeyCode::Tab => inventory_ui.cycle_special_slot(1),
+        KeyCode::BackTab => inventory_ui.cycle_special_slot(-1),
+        KeyCode::Enter => {
+            let button = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                InventoryButton::QuickMove
+            } else {
+                InventoryButton::Left
+            };
+            actions
+                .send(PlayerAction::InventoryClick {
+                    slot: inventory_ui.selected_slot(),
+                    button,
+                })
+                .map_err(|_| eyre::eyre!("client action loop stopped"))?;
+        }
+        KeyCode::Char('r') => {
+            actions
+                .send(PlayerAction::InventoryClick {
+                    slot: inventory_ui.selected_slot(),
+                    button: InventoryButton::Right,
+                })
+                .map_err(|_| eyre::eyre!("client action loop stopped"))?;
+        }
+        KeyCode::Char('q') => return Ok(false),
+        _ => {}
+    }
     Ok(true)
 }
 
@@ -312,6 +481,7 @@ impl TerminalSession {
         target: &str,
         hud: &HudSnapshot,
         minimap: Option<&str>,
+        inventory_ui: Option<&InventoryUi>,
     ) -> Result<()> {
         let minimap_rows: Vec<_> = minimap.map_or_else(Vec::new, |map| map.lines().collect());
         let mut bytes = String::with_capacity(frame.width * frame.sample_height * 22);
@@ -320,29 +490,87 @@ impl TerminalSession {
         bytes.push_str("\r\n\x1b[2K");
         bytes.push_str(target);
         bytes.push_str("\r\n\x1b[2K");
-        bytes.push_str(if self.reports_key_releases {
-            "WASD move/release stop · Shift+W sprint · arrows look · Space jump/swim · X stop · C crouch · Q quit"
+        bytes.push_str(if inventory_ui.is_some() {
+            "inventory: arrows select storage · Tab select equipment/craft · Enter pick/place · Shift+Enter move stack · R split/place one · E/Esc close · Q quit"
+        } else if self.reports_key_releases {
+            "WASD move/release stop · Shift+W sprint · arrows look · Space jump/swim · F break · G use/place · 1-9 hotbar · E inventory · Q quit"
         } else {
-            "WASD move · Shift+W sprint · arrows look · Space jump/swim · X stop · C crouch · Q quit"
+            "WASD move · Shift+W sprint · arrows look · Space jump/swim · F break · G use/place · 1-9 hotbar · E inventory · Q quit"
         });
         bytes.push_str("\x1b[0m\r\n");
 
-        for row in 0..(frame.sample_height / 2) {
-            for column in 0..frame.width {
-                append_half_block(
-                    &mut bytes,
-                    frame.pixel(column, row * 2),
-                    frame.pixel(column, row * 2 + 1),
-                );
+        if let Some(inventory_ui) = inventory_ui {
+            append_inventory_overlay(&mut bytes, hud, inventory_ui, frame.sample_height / 2);
+        } else {
+            for row in 0..(frame.sample_height / 2) {
+                for column in 0..frame.width {
+                    append_half_block(
+                        &mut bytes,
+                        frame.pixel(column, row * 2),
+                        frame.pixel(column, row * 2 + 1),
+                    );
+                }
+                append_minimap_sidebar(&mut bytes, row, &minimap_rows);
+                bytes.push_str("\x1b[0m\x1b[K\r\n");
             }
-            append_minimap_sidebar(&mut bytes, row, &minimap_rows);
-            bytes.push_str("\x1b[0m\x1b[K\r\n");
         }
         append_hud_line(&mut bytes, &hud.status_line(), true);
         append_hud_line(&mut bytes, &hud.hotbar_line(), false);
         self.output.write_all(bytes.as_bytes())?;
         self.output.flush()?;
         Ok(())
+    }
+}
+
+fn append_inventory_overlay(
+    output: &mut String,
+    hud: &HudSnapshot,
+    inventory_ui: &InventoryUi,
+    rows: usize,
+) {
+    let selected_slot = inventory_ui.selected_slot();
+    let cell = |slot| hud.inventory_cell(slot, slot == selected_slot);
+    let row = |start| {
+        (0..InventoryUi::COLUMNS)
+            .map(|offset| cell(start + offset))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let lines = [
+        format!(
+            "+---------------------- inventory ----------------------+  carried [{}]",
+            hud.carried_cell()
+        ),
+        format!(
+            "armor  {} {} {} {}   offhand {}",
+            cell(1),
+            cell(2),
+            cell(3),
+            cell(4),
+            cell(45),
+        ),
+        format!(
+            "craft  {} {}   {} {}   -> {}",
+            cell(5),
+            cell(6),
+            cell(7),
+            cell(8),
+            cell(0),
+        ),
+        format!("main   {}", row(9)),
+        format!("       {}", row(18)),
+        format!("       {}", row(27)),
+        format!("hotbar {}", row(36)),
+        "+-------------------------------------------------------+".to_owned(),
+        "server-synced player inventory · selected cell is >item<".to_owned(),
+    ];
+
+    for row in 0..rows {
+        output.push_str("\x1b[0m\x1b[2K");
+        if let Some(line) = lines.get(row) {
+            output.push_str(line);
+        }
+        output.push_str("\r\n");
     }
 }
 
@@ -403,5 +631,39 @@ mod tests {
         let mut encoded = String::new();
         append_half_block(&mut encoded, Rgb::new(1, 2, 3), Rgb::new(4, 5, 6));
         assert_eq!(encoded, "\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m▀");
+    }
+
+    #[test]
+    fn inventory_cursor_wraps_across_the_four_player_storage_rows() {
+        let mut inventory = InventoryUi::default();
+        inventory.move_by(-1, -1);
+
+        assert_eq!(inventory.selected_slot(), 44);
+        inventory.move_by(1, 1);
+        assert_eq!(inventory.selected_slot(), 9);
+    }
+
+    #[test]
+    fn inventory_cursor_cycles_special_equipment_and_crafting_slots() {
+        let mut inventory = InventoryUi::default();
+        inventory.cycle_special_slot(-1);
+        assert_eq!(inventory.selected_slot(), 45);
+        inventory.cycle_special_slot(1);
+        assert_eq!(inventory.selected_slot(), 0);
+        inventory.move_by(0, 0);
+        assert_eq!(inventory.selected_slot(), 9);
+    }
+
+    #[test]
+    fn inventory_overlay_marks_the_selected_server_slot() {
+        let mut hud = HudSnapshot::default();
+        hud.set_player_menu_slot(9, Some("minecraft:stone"), 64);
+        let inventory = InventoryUi::default();
+        let mut output = String::new();
+
+        append_inventory_overlay(&mut output, &hud, &inventory, 9);
+
+        assert!(output.contains(">ST64<"));
+        assert!(output.contains("server-synced player inventory"));
     }
 }

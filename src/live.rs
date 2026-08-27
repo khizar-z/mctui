@@ -5,16 +5,21 @@ use std::{
     net::IpAddr,
     str::FromStr,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender},
     },
 };
 
 use azalea::{
     Client, ClientInformation, Event,
+    block::fluid_state::FluidKind,
     core::data_registry::DataRegistryWithKey,
     ecs::query::Without,
-    entity::{EntityKindComponent, LocalEntity, Position, dimensions::EntityDimensions},
+    entity::{
+        EntityKindComponent, FluidOnEyes, LocalEntity, Position, dimensions::EntityDimensions,
+        metadata::AirSupply,
+    },
     prelude::{Account, Component, bevy_ecs},
     registry::data::WorldClockKey,
     world::WorldName,
@@ -269,6 +274,32 @@ pub(crate) type EntitySnapshots = Arc<RwLock<Vec<EntityMarker>>>;
 /// Shared packet-backed player HUD state for the terminal renderer.
 pub(crate) type HudSnapshots = Arc<RwLock<HudSnapshot>>;
 
+/// Commands produced by terminal input and executed from Azalea's event loop.
+///
+/// Rendering never takes the ECS lock for these actions. That keeps input
+/// responsive without reviving the terminal-thread ECS contention that caused
+/// entity rendering to freeze the client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlayerAction {
+    StartMining(BlockPos),
+    UseTargetedBlock(BlockPos),
+    SelectHotbarSlot(u8),
+    InventoryClick {
+        slot: usize,
+        button: InventoryButton,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryButton {
+    Left,
+    Right,
+    QuickMove,
+}
+
+pub(crate) type ActionSender = Sender<PlayerAction>;
+type ActionReceiver = Arc<Mutex<Receiver<PlayerAction>>>;
+
 /// Capture nearby streamed entities for the renderer.
 ///
 /// This runs from Azalea's event handler instead of the terminal thread. It
@@ -381,16 +412,21 @@ pub struct AppState {
     lighting: Arc<RwLock<LightStore>>,
     entity_snapshots: EntitySnapshots,
     hud: HudSnapshots,
+    action_sender: ActionSender,
+    action_receiver: ActionReceiver,
 }
 
 impl AppState {
     pub fn new(config: LiveConfig) -> Self {
+        let (action_sender, action_receiver) = std::sync::mpsc::channel();
         Self {
             config: Arc::new(config),
             renderer_started: Arc::new(AtomicBool::new(false)),
             lighting: Arc::new(RwLock::new(LightStore::default())),
             entity_snapshots: Arc::new(RwLock::new(Vec::new())),
             hud: Arc::new(RwLock::new(HudSnapshot::default())),
+            action_sender,
+            action_receiver: Arc::new(Mutex::new(action_receiver)),
         }
     }
 }
@@ -457,15 +493,19 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 let lighting = state.lighting.clone();
                 let entity_snapshots = state.entity_snapshots.clone();
                 let hud = state.hud.clone();
+                let action_sender = state.action_sender.clone();
                 std::thread::spawn(move || {
                     if let Err(error) = crate::terminal::run(
                         render_bot.clone(),
                         config.render,
                         config.target_fps,
-                        lighting,
-                        config.render_entities,
-                        entity_snapshots,
-                        hud,
+                        crate::terminal::TerminalResources {
+                            lighting,
+                            render_entities: config.render_entities,
+                            entity_snapshots,
+                            hud_snapshots: hud,
+                            actions: action_sender,
+                        },
                     ) {
                         eprintln!("terminal renderer stopped: {error:?}");
                         render_bot.exit();
@@ -476,6 +516,8 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
         Event::Packet(packet) => capture_protocol_data(&bot, &state.lighting, &state.hud, &packet),
         Event::Chat(chat) => println!("chat: {}", chat.message().to_ansi()),
         Event::Tick => {
+            drain_player_actions(&bot, &state.hud, &state.action_receiver);
+            refresh_drowning_indicator(&bot, &state.hud);
             if state.config.mode == Mode::Render
                 && state.config.render_entities
                 && bot.ticks_connected().is_multiple_of(5)
@@ -600,6 +642,7 @@ fn capture_protocol_data(
             for (slot, item) in packet.items.iter().enumerate() {
                 update_hud_player_menu_slot(&mut hud, slot, item);
             }
+            update_hud_carried_item(&mut hud, &packet.carried_item);
         }
         ClientboundGamePacket::ContainerSetSlot(packet)
             if matches!(packet.container_id, -2 | 0) =>
@@ -618,6 +661,12 @@ fn capture_protocol_data(
             } else {
                 update_hud_player_menu_slot(&mut hud, slot, &packet.contents);
             }
+        }
+        ClientboundGamePacket::SetCursorItem(packet) => {
+            update_hud_carried_item(
+                &mut hud.write().expect("HUD snapshot lock poisoned"),
+                &packet.contents,
+            );
         }
         _ => {}
     }
@@ -641,6 +690,66 @@ fn update_hud_hotbar_slot(hud: &mut HudSnapshot, slot: usize, item: &azalea::inv
         item.is_present().then(|| item.kind().to_str()),
         item.count(),
     );
+}
+
+fn update_hud_carried_item(hud: &mut HudSnapshot, item: &azalea::inventory::ItemStack) {
+    hud.set_carried_item(
+        item.is_present().then(|| item.kind().to_str()),
+        item.count(),
+    );
+}
+
+fn drain_player_actions(bot: &Client, hud: &HudSnapshots, receiver: &ActionReceiver) {
+    let Ok(receiver) = receiver.lock() else {
+        return;
+    };
+    let actions: Vec<_> = receiver.try_iter().collect();
+    drop(receiver);
+
+    for action in actions {
+        match action {
+            PlayerAction::StartMining(position) => {
+                bot.start_mining(azalea::BlockPos::new(position.x, position.y, position.z));
+            }
+            PlayerAction::UseTargetedBlock(position) => {
+                bot.block_interact(azalea::BlockPos::new(position.x, position.y, position.z));
+            }
+            PlayerAction::SelectHotbarSlot(slot) => {
+                bot.set_selected_hotbar_slot(slot);
+                hud.write()
+                    .expect("HUD snapshot lock poisoned")
+                    .set_selected_hotbar_slot(slot as usize);
+            }
+            PlayerAction::InventoryClick { slot, button } => {
+                let Ok(inventory) = bot.get_inventory() else {
+                    continue;
+                };
+                match button {
+                    InventoryButton::Left => inventory.left_click(slot),
+                    InventoryButton::Right => inventory.right_click(slot),
+                    InventoryButton::QuickMove => inventory.shift_click(slot),
+                }
+            }
+        }
+    }
+}
+
+fn refresh_drowning_indicator(bot: &Client, hud: &HudSnapshots) {
+    let Some(ecs) = bot.ecs.try_read() else {
+        return;
+    };
+    let air_supply = ecs.get::<AirSupply>(bot.entity).map(|air| **air);
+    let underwater = matches!(
+        ecs.get::<FluidOnEyes>(bot.entity),
+        Some(fluid) if **fluid == FluidKind::Water
+    );
+    drop(ecs);
+
+    if air_supply.is_some() {
+        hud.write()
+            .expect("HUD snapshot lock poisoned")
+            .set_air_supply(air_supply, underwater);
+    }
 }
 
 fn world_min_y(bot: &Client) -> Option<i32> {

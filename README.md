@@ -24,7 +24,9 @@ coloured pixels.
 - Water, glass, ice, and lava transparency with camera-underwater overlays
 - Interactive movement, sprinting, jumping, crouching, and look controls
 - Centre crosshair and live target HUD with block, face, distance, and light data
-- Packet-backed health, hunger, XP, and selected nine-slot hotbar HUD
+- Packet-backed health, hunger, XP, selected hotbar, and underwater air meter
+- Targeted server-authoritative block breaking, block use, and placement
+- Keyboard-driven, server-synchronised player inventory with stack and split actions
 - 15×15 navigation minimap that projects nearby terrain below the player
 - Conservative unloaded-chunk handling: unknown terrain is never rendered as sky
 
@@ -68,10 +70,28 @@ The client rejects non-loopback server addresses unless
 | `Space` | Jump or swim upward |
 | `C` | Toggle crouch |
 | `X` | Stop moving |
+| `F` | Break the targeted block within normal reach |
+| `G` | Use the targeted block or place the selected item against it |
+| `1`–`9` | Select a hotbar slot |
+| `E` | Open or close the player inventory |
 | `Q` or `Esc` | Quit |
 
 In terminals that support Kitty keyboard enhancement, releasing a movement key
 also stops movement. `X` is always available as a terminal-independent stop.
+
+### Inventory controls
+
+The inventory shows the server-synchronised player slots and the current cursor
+stack. It is a keyboard overlay, so it remains usable in a pure terminal.
+
+| Input | Action |
+| --- | --- |
+| Arrow keys | Move the selection across the 27 main-inventory and 9 hotbar slots |
+| `Tab` / `Shift` + `Tab` | Cycle crafting, output, armor, and offhand slots |
+| `Enter` | Pick up, place, merge, or swap a stack |
+| `Shift` + `Enter` | Quick-move the selected stack |
+| `R` | Right-click equivalent: split a stack or place one item |
+| `E` or `Esc` | Close the inventory overlay |
 
 ## Recommended command
 
@@ -156,8 +176,9 @@ without running the full renderer.
 
 ## Scope and safety
 
-mctui is a local-world visualiser and renderer. It can render, move, and look;
-it does not mine, craft, manage inventory, fight, or automate gameplay. The
+mctui is a local-world renderer with a small set of direct, player-triggered
+interactions: movement, targeted breaking/using/placing, hotbar selection, and
+player-inventory clicks. It does not craft, fight, or automate gameplay. The
 default local-only connection policy is intentional. If you use
 `--allow-public-server`, follow that server's rules and obtain permission.
 
