@@ -28,10 +28,6 @@ and safe synchronization between the game client and rendering thread.
 - Includes a keyboard-driven, server-synchronised player inventory overlay
 - Treats unloaded terrain conservatively instead of rendering unknown blocks as empty sky
 
-```text
-Minecraft packets → streamed blocks + light/clock sidecars → DDA raycaster → ANSI terminal frame
-```
-
 ## Quick start
 
 ### Requirements
@@ -60,16 +56,6 @@ cargo run --release -- --mode render \
   --width 120 --height 36 --fps 10 \
   --view-distance 12 --distance 80
 ```
-
-To try the experimental procedural material pass, add `--textures`:
-
-```sh
-cargo run --release -- --mode render --textures
-```
-
-It uses deterministic, world-anchored surface patterns rather than Minecraft
-asset files or a resource pack. Without the flag, mctui keeps its original
-compact flat-colour palette.
 
 `--width` and `--height` control the rendered viewport. The minimap occupies
 19 additional terminal columns, so the example above is most comfortable in a
@@ -161,8 +147,7 @@ the lighting authority.
 
 Each frame generates camera rays and advances them through the voxel grid with
 DDA. A ray can hit an opaque block, collect a bounded number of translucent
-layers, reach open sky, or enter an unloaded region. The last case is rendered
-as unknown terrain rather than fabricated sky. Face orientation, light,
+layers, reach open sky, or enter an unloaded region. Face orientation, light,
 time-of-day, distance fog, and a compact material palette produce the final
 pixel colour. With `--textures`, the final material colour receives a
 deterministic face-local detail pass: stone grain, grass top and side layers,
