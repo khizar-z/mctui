@@ -19,16 +19,15 @@ use crossterm::{
 };
 use eyre::Result;
 
-use mctui::{
-    Camera, EntityMarker, Frame, RenderConfig, Rgb, lighting::LightStore, navigation_minimap,
-};
+use mctui::{Camera, Frame, RenderConfig, Rgb, lighting::LightStore, navigation_minimap};
+
+use crate::live::EntitySnapshots;
 
 const MINIMAP_RADIUS: i32 = 7;
 const MINIMAP_WIDTH: usize = (MINIMAP_RADIUS as usize * 2) + 1;
 const MINIMAP_SIDEBAR_COLUMNS: usize = MINIMAP_WIDTH + 4; // gap, borders, and map cells
 const MINIMAP_ROWS: usize = MINIMAP_WIDTH + 4; // title, borders, cells, legend
 const MIN_RENDER_COLUMNS: usize = 20;
-const ENTITY_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const LOOK_STEP_DEGREES: f32 = 6.0;
 
 /// Run the interactive renderer until the user presses `q` or Escape.
@@ -38,6 +37,7 @@ pub fn run(
     target_fps: u16,
     lighting: Arc<RwLock<LightStore>>,
     render_entities: bool,
+    entity_snapshots: EntitySnapshots,
 ) -> Result<()> {
     let mut session = TerminalSession::enter()?;
     let layout = session.layout_for(config);
@@ -47,7 +47,6 @@ pub fn run(
     let mut frames = 0_u32;
     let mut fps = 0.0_f32;
     let mut fps_window = Instant::now();
-    let mut entity_cache = EntityCache::default();
 
     loop {
         let frame_started = Instant::now();
@@ -68,9 +67,14 @@ pub fn run(
             yaw_degrees: direction.y_rot(),
             pitch_degrees: direction.x_rot(),
         };
-        if render_entities {
-            entity_cache.refresh_if_stale(&bot);
-        }
+        let entity_markers = if render_entities {
+            entity_snapshots
+                .read()
+                .expect("entity snapshot lock poisoned")
+                .clone()
+        } else {
+            Vec::new()
+        };
 
         // Keep one read lock for the entire frame so every ray samples a
         // coherent snapshot of chunks that Azalea has already received.
@@ -79,8 +83,7 @@ pub fn run(
             let world = world.read();
             let lighting = lighting.read().expect("lighting cache lock poisoned");
             let live_world = crate::live::AzaleaWorld::new(&world, &lighting);
-            let frame =
-                Frame::render_with_entities(&live_world, camera, config, &entity_cache.markers);
+            let frame = Frame::render_with_entities(&live_world, camera, config, &entity_markers);
             let minimap = layout.show_minimap.then(|| {
                 navigation_minimap(
                     &live_world,
@@ -197,24 +200,6 @@ fn apply_key(bot: &Client, key: KeyEvent) -> Result<bool> {
 struct TerminalSession {
     output: io::Stdout,
     reports_key_releases: bool,
-}
-
-#[derive(Default)]
-struct EntityCache {
-    markers: Vec<EntityMarker>,
-    refreshed_at: Option<Instant>,
-}
-
-impl EntityCache {
-    fn refresh_if_stale(&mut self, bot: &Client) {
-        let stale = self
-            .refreshed_at
-            .is_none_or(|refreshed_at| refreshed_at.elapsed() >= ENTITY_REFRESH_INTERVAL);
-        if stale {
-            self.markers = crate::live::nearby_entity_markers(bot);
-            self.refreshed_at = Some(Instant::now());
-        }
-    }
 }
 
 #[derive(Clone, Copy)]

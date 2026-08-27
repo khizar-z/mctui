@@ -13,8 +13,11 @@ use std::{
 use azalea::{
     Client, ClientInformation, Event,
     core::data_registry::DataRegistryWithKey,
+    ecs::query::Without,
+    entity::{EntityKindComponent, LocalEntity, Position, dimensions::EntityDimensions},
     prelude::{Account, Component, bevy_ecs},
     registry::data::WorldClockKey,
+    world::WorldName,
 };
 use eyre::{Result, bail};
 
@@ -254,34 +257,68 @@ impl BlockSource for AzaleaWorld<'_> {
     }
 }
 
-/// Snapshot the nearest streamed entities for the renderer.
+/// Shared, immutable-by-convention entity data for the terminal renderer.
 ///
-/// This is intentionally observational: it only reads Azalea's local ECS
-/// state, excludes the controlled bot, and never sends interaction packets.
-pub fn nearby_entity_markers(bot: &Client) -> Vec<EntityMarker> {
+/// The renderer receives a cloned vector from this store and never touches
+/// Azalea's ECS. That separation prevents a slow terminal frame from blocking
+/// client-world updates.
+pub(crate) type EntitySnapshots = Arc<RwLock<Vec<EntityMarker>>>;
+
+/// Capture nearby streamed entities for the renderer.
+///
+/// This runs from Azalea's event handler instead of the terminal thread. It
+/// takes the ECS lock at most once and uses `try_write` so an entity refresh
+/// is skipped, rather than ever blocking the client loop, when the ECS is
+/// momentarily busy.
+fn refresh_entity_snapshots(bot: &Client, snapshots: &EntitySnapshots) {
     const MAX_MARKERS: usize = 24;
 
-    let Ok(entities) =
-        bot.nearest_entities::<azalea::ecs::query::Without<azalea::entity::LocalEntity>>()
-    else {
-        return Vec::new();
+    let Some(mut ecs) = bot.ecs.try_write() else {
+        return;
     };
 
-    entities
-        .into_iter()
-        .filter_map(|entity| {
-            let category = entity_category(entity.kind().ok()?);
-            let position = entity.position().ok()?;
-            let dimensions = entity.dimensions().ok()?;
+    let Some(world_name) = ecs.get::<WorldName>(bot.entity).cloned() else {
+        return;
+    };
+    let Some(player_position) = ecs
+        .get::<Position>(bot.entity)
+        .map(|position| Vec3::new(position.x, position.y, position.z))
+    else {
+        return;
+    };
+
+    let mut query = ecs.query_filtered::<(
+        &WorldName,
+        &Position,
+        &EntityDimensions,
+        &EntityKindComponent,
+    ), Without<LocalEntity>>();
+    let mut markers = query
+        .iter(&ecs)
+        .filter(|(entity_world, ..)| *entity_world == &world_name)
+        .filter_map(|(_, position, dimensions, kind)| {
             (dimensions.width > 0.0 && dimensions.height > 0.0).then_some(EntityMarker {
                 position: Vec3::new(position.x, position.y, position.z),
                 width: f64::from(dimensions.width),
                 height: f64::from(dimensions.height),
-                category,
+                category: entity_category(**kind),
             })
         })
-        .take(MAX_MARKERS)
-        .collect()
+        .collect::<Vec<_>>();
+    markers.sort_by(|left, right| {
+        let left_offset = left.position - player_position;
+        let right_offset = right.position - player_position;
+        left_offset
+            .dot(left_offset)
+            .total_cmp(&right_offset.dot(right_offset))
+    });
+    markers.truncate(MAX_MARKERS);
+
+    // Release Azalea's ECS before publishing. Rendering only locks the small
+    // Vec long enough to clone it, so these two locks can never form a cycle.
+    drop(query);
+    drop(ecs);
+    *snapshots.write().expect("entity snapshot lock poisoned") = markers;
 }
 
 fn entity_category(kind: azalea::registry::builtin::EntityKind) -> EntityCategory {
@@ -337,6 +374,7 @@ pub struct AppState {
     config: Arc<LiveConfig>,
     renderer_started: Arc<AtomicBool>,
     lighting: Arc<RwLock<LightStore>>,
+    entity_snapshots: EntitySnapshots,
 }
 
 impl AppState {
@@ -345,6 +383,7 @@ impl AppState {
             config: Arc::new(config),
             renderer_started: Arc::new(AtomicBool::new(false)),
             lighting: Arc::new(RwLock::new(LightStore::default())),
+            entity_snapshots: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -393,6 +432,11 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 .write()
                 .expect("lighting cache lock poisoned")
                 .clear();
+            state
+                .entity_snapshots
+                .write()
+                .expect("entity snapshot lock poisoned")
+                .clear();
             println!("Login accepted; waiting for spawn and chunks...");
         }
         Event::Spawn => {
@@ -403,6 +447,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 let render_bot = bot.clone();
                 let config = state.config.clone();
                 let lighting = state.lighting.clone();
+                let entity_snapshots = state.entity_snapshots.clone();
                 std::thread::spawn(move || {
                     if let Err(error) = crate::terminal::run(
                         render_bot.clone(),
@@ -410,6 +455,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                         config.target_fps,
                         lighting,
                         config.render_entities,
+                        entity_snapshots,
                     ) {
                         eprintln!("terminal renderer stopped: {error:?}");
                         render_bot.exit();
@@ -419,38 +465,47 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
         }
         Event::Packet(packet) => capture_protocol_data(&bot, &state.lighting, &packet),
         Event::Chat(chat) => println!("chat: {}", chat.message().to_ansi()),
-        Event::Tick => match state.config.mode {
-            Mode::Monitor if bot.ticks_connected().is_multiple_of(10) => {
-                let position = bot.position()?;
-                let direction = bot.direction()?;
-                let light_position = position_to_block(position);
-                let lighting = state.lighting.read().expect("lighting cache lock poisoned");
-                let light = lighting.light_at(light_position);
-                println!(
-                    "position {}  yaw {:.1} pitch {:.1}  light {}  day {:.2} ({})",
-                    format_position(position),
-                    direction.y_rot(),
-                    direction.x_rot(),
-                    light.map_or_else(
-                        || "pending".to_owned(),
-                        |levels| format!("block={} sky={}", levels.block, levels.sky)
-                    ),
-                    lighting.day_factor(),
-                    if lighting.has_received_time() {
-                        "packet clock"
-                    } else {
-                        "initial noon fallback"
-                    },
-                );
+        Event::Tick => {
+            if state.config.mode == Mode::Render
+                && state.config.render_entities
+                && bot.ticks_connected().is_multiple_of(5)
+            {
+                refresh_entity_snapshots(&bot, &state.entity_snapshots);
             }
-            Mode::Minimap if bot.ticks_connected().is_multiple_of(4) => {
-                print_live_minimap(&bot, &state.lighting)?
+
+            match state.config.mode {
+                Mode::Monitor if bot.ticks_connected().is_multiple_of(10) => {
+                    let position = bot.position()?;
+                    let direction = bot.direction()?;
+                    let light_position = position_to_block(position);
+                    let lighting = state.lighting.read().expect("lighting cache lock poisoned");
+                    let light = lighting.light_at(light_position);
+                    println!(
+                        "position {}  yaw {:.1} pitch {:.1}  light {}  day {:.2} ({})",
+                        format_position(position),
+                        direction.y_rot(),
+                        direction.x_rot(),
+                        light.map_or_else(
+                            || "pending".to_owned(),
+                            |levels| format!("block={} sky={}", levels.block, levels.sky)
+                        ),
+                        lighting.day_factor(),
+                        if lighting.has_received_time() {
+                            "packet clock"
+                        } else {
+                            "initial noon fallback"
+                        },
+                    );
+                }
+                Mode::Minimap if bot.ticks_connected().is_multiple_of(4) => {
+                    print_live_minimap(&bot, &state.lighting)?
+                }
+                Mode::Ray if bot.ticks_connected().is_multiple_of(5) => {
+                    print_forward_hit(&bot, state.config.render.max_distance, &state.lighting)?
+                }
+                _ => {}
             }
-            Mode::Ray if bot.ticks_connected().is_multiple_of(5) => {
-                print_forward_hit(&bot, state.config.render.max_distance, &state.lighting)?
-            }
-            _ => {}
-        },
+        }
         Event::Disconnect(reason) => {
             eprintln!("Disconnected: {reason:?}");
             bot.exit();
