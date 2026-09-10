@@ -78,12 +78,17 @@ passed explicitly. Only connect it to servers that permit bots.
 | `F` | Break the targeted block within normal reach |
 | `G` | Use the targeted block or place the selected item against it |
 | `1`–`9` | Select a hotbar slot |
+| `T` | Open chat; messages beginning with `/` run server commands |
 | `E` | Open or close the player inventory |
 | `Q` or `Esc` | Quit |
 
 When the terminal reports Kitty keyboard-enhancement key releases, releasing a
 movement key also stops the player. `X` is the portable stop control and works
 in every supported terminal.
+
+Recent server chat and system events—such as player messages, join/leave
+notices, deaths, and command responses—appear as a compact overlay. While the
+chat prompt is open, `Enter` sends the message and `Esc` cancels it.
 
 ### Inventory controls
 

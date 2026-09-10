@@ -1,3 +1,4 @@
+mod chat;
 mod hud;
 mod live;
 mod terminal;

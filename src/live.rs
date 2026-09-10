@@ -27,7 +27,7 @@ use azalea::{
 };
 use eyre::{Result, bail};
 
-use crate::hud::HudSnapshot;
+use crate::{chat::ChatFeed, hud::HudSnapshot};
 
 use mctui::{
     Block, BlockPos, BlockSource, Camera, EntityCategory, EntityMarker, LightLevels, RayResult,
@@ -290,6 +290,9 @@ pub(crate) type EntitySnapshots = Arc<RwLock<Vec<EntityMarker>>>;
 /// Shared packet-backed player HUD state for the terminal renderer.
 pub(crate) type HudSnapshots = Arc<RwLock<HudSnapshot>>;
 
+/// Shared server-supplied chat and game-event feed for the terminal overlay.
+pub(crate) type ChatSnapshots = Arc<RwLock<ChatFeed>>;
+
 /// The latest authoritative block states received after a chunk was streamed.
 ///
 /// Azalea applies these updates to its shared world on the next ECS update;
@@ -308,11 +311,12 @@ pub(crate) enum BlockOverride {
 /// Rendering never takes the ECS lock for these actions. That keeps input
 /// responsive without reviving the terminal-thread ECS contention that caused
 /// entity rendering to freeze the client.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PlayerAction {
     StartMining(BlockPos),
     UseTargetedBlock(BlockPos),
     SelectHotbarSlot(u8),
+    SendChat(String),
     InventoryClick {
         slot: usize,
         button: InventoryButton,
@@ -441,6 +445,7 @@ pub struct AppState {
     lighting: Arc<RwLock<LightStore>>,
     entity_snapshots: EntitySnapshots,
     hud: HudSnapshots,
+    chat: ChatSnapshots,
     block_overrides: BlockOverrides,
     action_sender: ActionSender,
     action_receiver: ActionReceiver,
@@ -455,6 +460,7 @@ impl AppState {
             lighting: Arc::new(RwLock::new(LightStore::default())),
             entity_snapshots: Arc::new(RwLock::new(Vec::new())),
             hud: Arc::new(RwLock::new(HudSnapshot::default())),
+            chat: Arc::new(RwLock::new(ChatFeed::default())),
             block_overrides: Arc::new(RwLock::new(HashMap::new())),
             action_sender,
             action_receiver: Arc::new(Mutex::new(action_receiver)),
@@ -517,6 +523,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 .expect("block override lock poisoned")
                 .clear();
             *state.hud.write().expect("HUD snapshot lock poisoned") = HudSnapshot::default();
+            state.chat.write().expect("chat feed lock poisoned").clear();
             println!("Login accepted; waiting for spawn and chunks...");
         }
         Event::Spawn => {
@@ -529,6 +536,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                 let lighting = state.lighting.clone();
                 let entity_snapshots = state.entity_snapshots.clone();
                 let hud = state.hud.clone();
+                let chat = state.chat.clone();
                 let block_overrides = state.block_overrides.clone();
                 let action_sender = state.action_sender.clone();
                 std::thread::spawn(move || {
@@ -541,6 +549,7 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
                             render_entities: config.render_entities,
                             entity_snapshots,
                             hud_snapshots: hud,
+                            chat_snapshots: chat,
                             block_overrides,
                             actions: action_sender,
                         },
@@ -558,7 +567,17 @@ async fn handle_event(bot: Client, event: Event, state: AppState) -> Result<()> 
             &state.block_overrides,
             &packet,
         ),
-        Event::Chat(chat) => println!("chat: {}", chat.message().to_ansi()),
+        Event::Chat(chat) => {
+            let message = chat.message().to_string();
+            state
+                .chat
+                .write()
+                .expect("chat feed lock poisoned")
+                .push(&message);
+            if state.config.mode != Mode::Render {
+                println!("chat: {message}");
+            }
+        }
         Event::Tick => {
             drain_player_actions(&bot, &state.hud, &state.action_receiver);
             reconcile_block_overrides(&bot, &state.block_overrides);
@@ -882,6 +901,7 @@ fn drain_player_actions(bot: &Client, hud: &HudSnapshots, receiver: &ActionRecei
                     .expect("HUD snapshot lock poisoned")
                     .set_selected_hotbar_slot(slot as usize);
             }
+            PlayerAction::SendChat(message) => bot.chat(message),
             PlayerAction::InventoryClick { slot, button } => {
                 let Ok(inventory) = bot.get_inventory() else {
                     continue;

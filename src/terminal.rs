@@ -27,7 +27,8 @@ use mctui::{
 use crate::{
     hud::HudSnapshot,
     live::{
-        ActionSender, BlockOverrides, EntitySnapshots, HudSnapshots, InventoryButton, PlayerAction,
+        ActionSender, BlockOverrides, ChatSnapshots, EntitySnapshots, HudSnapshots,
+        InventoryButton, PlayerAction,
     },
 };
 
@@ -41,12 +42,14 @@ const HUD_ROWS: usize = 2;
 const CHROME_ROWS: usize = HEADER_ROWS + HUD_ROWS;
 const LOOK_STEP_DEGREES: f32 = 6.0;
 const INTERACTION_REACH: f64 = 5.0;
+const CHAT_OVERLAY_ROWS: usize = 5;
 
 pub(crate) struct TerminalResources {
     pub lighting: Arc<RwLock<LightStore>>,
     pub render_entities: bool,
     pub entity_snapshots: EntitySnapshots,
     pub hud_snapshots: HudSnapshots,
+    pub chat_snapshots: ChatSnapshots,
     pub block_overrides: BlockOverrides,
     pub actions: ActionSender,
 }
@@ -68,6 +71,7 @@ pub fn run(
     let mut fps = 0.0_f32;
     let mut fps_window = Instant::now();
     let mut inventory_ui = InventoryUi::default();
+    let mut chat_input = ChatInput::default();
     let mut interaction_target = None;
 
     loop {
@@ -76,6 +80,7 @@ pub fn run(
             &bot,
             &resources.actions,
             &mut inventory_ui,
+            &mut chat_input,
             interaction_target,
         )? {
             bot.exit();
@@ -108,6 +113,11 @@ pub fn run(
             .read()
             .expect("HUD snapshot lock poisoned")
             .clone();
+        let chat_messages = resources
+            .chat_snapshots
+            .read()
+            .expect("chat feed lock poisoned")
+            .recent(CHAT_OVERLAY_ROWS);
         let block_overrides = resources
             .block_overrides
             .read()
@@ -164,6 +174,8 @@ pub fn run(
                 hud: &hud,
                 minimap: minimap.as_deref(),
                 inventory_ui: inventory_ui.open.then_some(&inventory_ui),
+                chat_messages: &chat_messages,
+                chat_input: chat_input.open.then_some(&chat_input),
                 text_columns: layout.text_columns,
             },
         )?;
@@ -213,6 +225,7 @@ fn read_input(
     bot: &Client,
     actions: &ActionSender,
     inventory_ui: &mut InventoryUi,
+    chat_input: &mut ChatInput,
     interaction_target: Option<mctui::BlockPos>,
 ) -> Result<bool> {
     while event::poll(Duration::ZERO)? {
@@ -222,7 +235,10 @@ fn read_input(
         if key.kind == KeyEventKind::Release {
             // Most terminal emulators do not report key releases. If one does,
             // honour it by stopping the ongoing walk command.
-            if !inventory_ui.open && matches!(key.code, KeyCode::Char('w' | 'a' | 's' | 'd')) {
+            if !inventory_ui.open
+                && !chat_input.open
+                && matches!(key.code, KeyCode::Char('w' | 'a' | 's' | 'd'))
+            {
                 bot.walk(WalkDirection::None);
             }
             continue;
@@ -230,7 +246,14 @@ fn read_input(
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             continue;
         }
-        if !apply_key(bot, actions, inventory_ui, interaction_target, key)? {
+        if !apply_key(
+            bot,
+            actions,
+            inventory_ui,
+            chat_input,
+            interaction_target,
+            key,
+        )? {
             return Ok(false);
         }
     }
@@ -241,9 +264,13 @@ fn apply_key(
     bot: &Client,
     actions: &ActionSender,
     inventory_ui: &mut InventoryUi,
+    chat_input: &mut ChatInput,
     interaction_target: Option<mctui::BlockPos>,
     key: KeyEvent,
 ) -> Result<bool> {
+    if chat_input.open {
+        return apply_chat_key(actions, chat_input, key);
+    }
     if inventory_ui.open {
         return apply_inventory_key(actions, inventory_ui, key);
     }
@@ -261,6 +288,11 @@ fn apply_key(
             }
             KeyCode::Char('e') => {
                 inventory_ui.open = true;
+                return Ok(true);
+            }
+            KeyCode::Char('t') => {
+                bot.walk(WalkDirection::None);
+                chat_input.begin();
                 return Ok(true);
             }
             KeyCode::Char('f') => {
@@ -337,6 +369,70 @@ fn queue_targeted_action(
     actions
         .send(action(target))
         .map_err(|_| eyre::eyre!("client action loop stopped"))
+}
+
+#[derive(Clone, Debug, Default)]
+struct ChatInput {
+    open: bool,
+    text: String,
+}
+
+impl ChatInput {
+    const MAX_CHARACTERS: usize = 256;
+
+    fn begin(&mut self) {
+        self.open = true;
+        self.text.clear();
+    }
+
+    fn push(&mut self, character: char) {
+        if !character.is_control() && self.text.chars().count() < Self::MAX_CHARACTERS {
+            self.text.push(character);
+        }
+    }
+
+    fn backspace(&mut self) {
+        self.text.pop();
+    }
+
+    fn cancel(&mut self) {
+        self.open = false;
+        self.text.clear();
+    }
+
+    fn submit(&mut self) -> Option<String> {
+        self.open = false;
+        let text = std::mem::take(&mut self.text);
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
+    }
+}
+
+fn apply_chat_key(
+    actions: &ActionSender,
+    chat_input: &mut ChatInput,
+    key: KeyEvent,
+) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => chat_input.cancel(),
+        KeyCode::Enter => {
+            if let Some(message) = chat_input.submit() {
+                actions
+                    .send(PlayerAction::SendChat(message))
+                    .map_err(|_| eyre::eyre!("client action loop stopped"))?;
+            }
+        }
+        KeyCode::Backspace => chat_input.backspace(),
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            chat_input.push(character)
+        }
+        _ => {}
+    }
+    Ok(true)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -450,6 +546,8 @@ struct DrawView<'a> {
     hud: &'a HudSnapshot,
     minimap: Option<&'a str>,
     inventory_ui: Option<&'a InventoryUi>,
+    chat_messages: &'a [String],
+    chat_input: Option<&'a ChatInput>,
     text_columns: usize,
 }
 
@@ -522,10 +620,12 @@ impl TerminalSession {
         append_text_line(&mut bytes, view.target, view.text_columns, true);
         let controls = if view.inventory_ui.is_some() {
             "inventory: arrows select storage · Tab select equipment/craft · Enter pick/place · Shift+Enter move stack · R split/place one · E/Esc close · Q quit"
+        } else if view.chat_input.is_some() {
+            "chat: type a message or /command · Enter send · Esc cancel"
         } else if self.reports_key_releases {
-            "WASD move/release stop · Shift+W sprint · arrows look · Space jump/swim · F break · G use/place · 1-9 hotbar · E inventory · Q quit"
+            "WASD move/release stop · Shift+W sprint · arrows look · Space jump/swim · F break · G use/place · 1-9 hotbar · T chat · E inventory · Q quit"
         } else {
-            "WASD move · Shift+W sprint · arrows look · Space jump/swim · F break · G use/place · 1-9 hotbar · E inventory · Q quit"
+            "WASD move · Shift+W sprint · arrows look · Space jump/swim · F break · G use/place · 1-9 hotbar · T chat · E inventory · Q quit"
         };
         append_text_line(&mut bytes, controls, view.text_columns, true);
 
@@ -557,6 +657,15 @@ impl TerminalSession {
             view.text_columns,
             false,
         );
+        if view.inventory_ui.is_none() {
+            append_chat_overlay(
+                &mut bytes,
+                view.chat_messages,
+                view.chat_input,
+                frame.sample_height / 2,
+                frame.width,
+            );
+        }
         self.output.write_all(bytes.as_bytes())?;
         self.output.flush()?;
         Ok(())
@@ -622,6 +731,46 @@ fn append_text_line(output: &mut String, line: &str, text_columns: usize, newlin
     if newline {
         output.push_str("\r\n");
     }
+}
+
+fn append_chat_overlay(
+    output: &mut String,
+    messages: &[String],
+    chat_input: Option<&ChatInput>,
+    frame_rows: usize,
+    frame_columns: usize,
+) {
+    let message_limit = CHAT_OVERLAY_ROWS.saturating_sub(usize::from(chat_input.is_some()));
+    let first_message = messages.len().saturating_sub(message_limit);
+    let mut lines: Vec<_> = messages[first_message..]
+        .iter()
+        .map(|message| format!("▌ {message}"))
+        .collect();
+    if let Some(chat_input) = chat_input {
+        lines.push(format!("> {}_", chat_input.text));
+    }
+
+    let visible_lines = lines.len().min(frame_rows);
+    let skipped_lines = lines.len().saturating_sub(visible_lines);
+    let first_terminal_row = HEADER_ROWS + frame_rows - visible_lines + 1;
+    for (offset, line) in lines.into_iter().skip(skipped_lines).enumerate() {
+        append_chat_overlay_line(output, first_terminal_row + offset, &line, frame_columns);
+    }
+}
+
+fn append_chat_overlay_line(output: &mut String, row: usize, line: &str, columns: usize) {
+    use std::fmt::Write;
+
+    let _ = write!(
+        output,
+        "\x1b[{row};1H\x1b[38;2;238;238;238m\x1b[48;2;18;18;22m "
+    );
+    output.extend(
+        line.chars()
+            .filter(|character| !character.is_control())
+            .take(columns.saturating_sub(2)),
+    );
+    output.push_str(" \x1b[0m");
 }
 
 fn append_minimap_sidebar(output: &mut String, row: usize, minimap_rows: &[&str]) {
@@ -747,5 +896,67 @@ mod tests {
             movement_for_key(KeyCode::Char('d')),
             Some(WalkDirection::Right)
         );
+    }
+
+    #[test]
+    fn chat_input_edits_submits_and_cancels_without_leaking_state() {
+        let mut input = ChatInput::default();
+        input.begin();
+        input.push('h');
+        input.push('i');
+        input.backspace();
+        input.push('!');
+
+        assert_eq!(input.submit(), Some("h!".to_owned()));
+        assert!(!input.open);
+
+        input.begin();
+        input.push(' ');
+        assert_eq!(input.submit(), None);
+        assert!(!input.open);
+    }
+
+    #[test]
+    fn chat_submission_is_queued_for_the_client_event_loop() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut input = ChatInput::default();
+        input.begin();
+        input.push('/');
+        input.push('d');
+        input.push('a');
+        input.push('y');
+
+        apply_chat_key(
+            &sender,
+            &mut input,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(PlayerAction::SendChat("/day".to_owned()))
+        );
+    }
+
+    #[test]
+    fn chat_overlay_reserves_a_row_for_the_active_prompt() {
+        let messages = ["one", "two", "three", "four", "five"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut input = ChatInput::default();
+        input.begin();
+        input.push('h');
+        input.push('i');
+        let mut output = String::new();
+
+        append_chat_overlay(&mut output, &messages, Some(&input), 8, 20);
+
+        assert!(output.contains("\x1b[7;1H"));
+        assert!(!output.contains("▌ one"));
+        assert!(output.contains("▌ two"));
+        assert!(output.contains("> hi_"));
+        assert!(!output.contains("\x1b[2K"));
     }
 }
